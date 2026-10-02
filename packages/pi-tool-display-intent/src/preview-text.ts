@@ -166,11 +166,13 @@ function formatPreviewTruncationHint(
 
 export class PreviewText implements Component {
 	private renderedText?: Text;
+	private renderedWidth?: number;
 
 	constructor(private readonly options: PreviewTextOptions) {}
 
 	render(width: number): string[] {
 		const safeWidth = normalizeWidth(width);
+		if (this.renderedText && this.renderedWidth === safeWidth) return this.renderedText.render(safeWidth);
 		const layout = layoutPreviewRows(
 			this.options.lines,
 			this.options.maxRows,
@@ -218,11 +220,13 @@ export class PreviewText implements Component {
 
 		preview = this.options.appendHints?.(preview) ?? preview;
 		this.renderedText = new Text(preview, 0, 0);
+		this.renderedWidth = safeWidth;
 		return this.renderedText.render(safeWidth);
 	}
 
 	invalidate(): void {
 		this.renderedText?.invalidate();
 		this.renderedText = undefined;
+		this.renderedWidth = undefined;
 	}
 }

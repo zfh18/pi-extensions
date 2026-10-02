@@ -235,3 +235,33 @@ test("fresh module takes over active tool, assistant and viewport hooks through 
 	exercise(t, f, B, uiB.projection, data);
 	assert.ok(counts.every((count, index) => count > before[index]), "late old cleanup must preserve foreign wrappers and the new host");
 });
+
+test("fresh native loader adopts assistant cache invalidation hooks and survives late cleanup", async (t) => {
+	const load = await loader(t);
+	const old = await load();
+	const prototype = sdk.AssistantMessageComponent.prototype;
+	const update = prototype.updateContent;
+	let updates = 0;
+	prototype.updateContent = function(...args) { updates++; return update.apply(this, args); };
+	old.thinking.patchAggregateThinkingPlaceholders(() => true);
+	const source = { role: "assistant", stopReason: "stop", content: [
+		{ type: "thinking", thinking: "hidden" }, { type: "text", text: "original answer" },
+	] };
+	const component = new sdk.AssistantMessageComponent(source as never, true);
+	component.render(80);
+	updates = 0;
+	component.render(80);
+	assert.equal(updates, 0);
+	const fresh = await load();
+	fresh.thinking.patchAggregateThinkingPlaceholders(() => true);
+	old.thinking.restoreAggregateThinkingPlaceholders();
+	source.content[1].text = "answer after reload";
+	component.updateContent(source as never);
+	assert.match(component.render(80).join("\n"), /answer after reload/);
+	updates = 0;
+	component.render(80);
+	assert.equal(updates, 0, "new owner must retain the cache hooks");
+	component.invalidate();
+	component.render(80);
+	assert.ok(updates > 0, "new owner must still invalidate cached bodies");
+});

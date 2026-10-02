@@ -265,3 +265,33 @@ for (const stopReason of ["stop", "length", "error", "aborted", "pending", "tool
 		assert.deepEqual(p.getAssistantContextLines(b, true), []);
 	});
 }
+
+test("live context refresh leaves completed runs cached and full rebuild still invalidates them", () => {
+	const p = projection();
+	const { a, b, branch } = fixture();
+	p.rebuild(branch);
+	let historical = 0;
+	p.connectRenderer("call-a", "read", { path: "a.ts" }, () => historical++);
+	p.connectContextRenderer(a, () => historical++);
+	p.connectContextRenderer(b, () => historical++);
+	const nextUser = entry("next-user", { role: "user", content: "next request", timestamp: 10 });
+	p.ingestUserMessage(nextUser.message);
+	const c = { ...assistant("c", 2000, 40, "read"), timestamp: 11,
+		content: [{ type: "toolCall", id: "call-c", name: "read", arguments: { path: "c.ts" } }] };
+	const cResult = { ...result, toolCallId: "call-c", timestamp: 12 };
+	p.ingestAssistantMessage(c);
+	p.ingestToolResult(cResult);
+	let current = 0;
+	p.connectRenderer("call-c", "read", { path: "c.ts" }, () => current++);
+	p.connectContextRenderer(c, () => current++);
+	historical = current = 0;
+	const nextBranch = [...branch, nextUser, entry("c", c), entry("c-result", cResult)];
+	p.finishContextTurn(c, [cResult], nextBranch);
+	assert.equal(historical, 0, "a new turn must not flush completed runs");
+	assert.ok(current > 0, "updated context remains visible");
+	assert.deepEqual(p.getView("call-a")!.contextGrowth, { tokens: 630, estimated: true });
+	assert.deepEqual(p.getView("call-c")!.contextGrowth, { tokens: 140, estimated: true });
+	p.rebuildContextGrowth(nextBranch);
+	assert.ok(historical > 0, "explicit full rebuild keeps its invalidation contract");
+	p.markGroupSettled();
+});

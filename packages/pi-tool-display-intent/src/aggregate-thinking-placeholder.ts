@@ -30,6 +30,8 @@ interface PatchableAssistantMessage {
 interface PatchableAssistantPrototype {
 	render(width: number): string[];
 	setExpanded?(expanded: boolean): void;
+	updateContent?: PatchableAssistantMessage["updateContent"];
+	invalidate?: () => void;
 	[AGGREGATE_THINKING_PATCH_KEY]?: AggregateThinkingPatchState;
 	[LEGACY_THINKING_PATCH_KEY]?: AggregateThinkingPatchState;
 }
@@ -39,6 +41,11 @@ interface AggregateThinkingPatchState {
 	releaseOwner(): void;
 	renderImpl: (this: PatchableAssistantMessage, width: number) => string[];
 	onExpanded?: (this: PatchableAssistantMessage, expanded: boolean) => void;
+	onContentChanged?: (this: PatchableAssistantMessage) => void;
+	originalUpdateContent?: PatchableAssistantMessage["updateContent"];
+	patchedUpdateContent: NonNullable<PatchableAssistantMessage["updateContent"]>;
+	originalInvalidate?: () => void;
+	patchedInvalidate: () => void;
 	originalRender: (this: PatchableAssistantMessage, width: number) => string[];
 	patchedRender: (this: PatchableAssistantMessage, width: number) => string[];
 	originalSetExpanded?: (this: PatchableAssistantMessage, expanded: boolean) => void;
@@ -62,6 +69,23 @@ const OSC_SEQUENCE_PATTERN = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
 const ANSI_SEQUENCE_PATTERN = /\x1b\[[0-9;]*[a-zA-Z]/g;
 const registeredApis = new WeakSet<ExtensionAPI>();
 let thinkingOwner: ExtensionAPI | undefined;
+
+// One layout per component; no transcript-sized string keys or retained components.
+let bodyLayouts = new WeakMap<PatchableAssistantMessage, {
+	width: number;
+	stripThinking: boolean;
+	label: string;
+	lines: string[];
+}>();
+
+function invalidateDecoration(component: PatchableAssistantMessage): void {
+	const body = bodyLayouts.get(component);
+	try { component.invalidate?.(); } catch { /* Disposed transcript component. */ }
+	finally {
+		// Context/frames changed, not the message, theme or Markdown layout.
+		if (body) bodyLayouts.set(component, body);
+	}
+}
 
 function toRecord(value: unknown): Record<string, unknown> {
 	return value && typeof value === "object" && !Array.isArray(value)
@@ -247,9 +271,23 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 			try { this.invalidate?.(); } catch { /* Disposed transcript component. */ }
 		};
 	}
+	// Also install these hooks when adopting a pre-cache patch after /reload.
+	if (!state.patchedUpdateContent) {
+		state.originalUpdateContent = prototype.updateContent;
+		state.originalInvalidate = prototype.invalidate;
+		state.patchedUpdateContent = function(message, isStreaming) {
+			state.onContentChanged?.call(this);
+			return state.originalUpdateContent?.call(this, message, isStreaming);
+		};
+		state.patchedInvalidate = function() {
+			state.onContentChanged?.call(this);
+			return state.originalInvalidate?.call(this);
+		};
+	}
 	state.owner = THINKING_MODULE;
 	state.releaseOwner = () => { THINKING_MODULE.retired = true; thinkingOwner = undefined; };
 	state.isAggregateEnabled = isAggregateEnabled;
+	state.onContentChanged = function() { bodyLayouts.delete(this); };
 	state.onExpanded = function(expanded) {
 		this[AGGREGATE_ASSISTANT_EXPANDED_KEY] = expanded === true;
 		resolveAggregateProjection(undefined, aggregateAssistantFrameId(this.lastMessage), firstToolCallId(this.lastMessage))
@@ -272,21 +310,24 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 		const narrationWidth = interim
 			? Math.max(1, width - visibleWidth(`${framePrefixForEdge("start")}${AGGREGATE_ASSISTANT_MARK} `))
 			: width;
-		const lines = stripThinkingBody
-			? renderWithoutThinkingBlocks(this, state.originalRender, narrationWidth)
-			: state.originalRender.call(this, narrationWidth);
-		const next = stripCollapsedThinkingPlaceholderLines(lines, resolveHiddenThinkingLabel(this));
+		const label = resolveHiddenThinkingLabel(this);
+		let body = bodyLayouts.get(this);
+		if (!body || body.width !== narrationWidth || body.stripThinking !== stripThinkingBody || body.label !== label) {
+			const lines = stripThinkingBody
+				? renderWithoutThinkingBlocks(this, state.originalRender, narrationWidth)
+				: state.originalRender.call(this, narrationWidth);
+			body = { width: narrationWidth, stripThinking: stripThinkingBody, label,
+				lines: stripCollapsedThinkingPlaceholderLines(lines, label) };
+			bodyLayouts.set(this, body);
+		}
+		const next = body.lines;
 		const toolCallId = firstToolCallId(this.lastMessage);
 		const frameId = assistantFrameId(this);
 		const projection = resolveAggregateProjection(undefined, frameId, toolCallId);
-		projection?.connectContextRenderer(this.lastMessage, () => {
-			try { this.invalidate?.(); } catch { /* Disposed transcript component. */ }
-		});
+		projection?.connectContextRenderer(this.lastMessage, () => invalidateDecoration(this));
 		const expanded = projection?.isMessageExpanded(this.lastMessage, isExpanded(this, projection?.isTimelineExpanded()))
 			?? isExpanded(this);
-		const contextLines = (projection?.getAssistantContextLines(this.lastMessage, expanded) ?? [])
-			.map((line) => truncateToWidth(`  ${resolveAggregateRenderTheme(projection).fg("muted", line)}`, Math.max(0, width), "…"));
-		const trimmed = trimBlankEdges(next);
+		const trimmed = next;
 		if (interim) {
 			recordAggregateClickRegions(this, width, 0);
 			if (!hasNarrationText || trimmed.length === 0 || !expanded) {
@@ -296,15 +337,11 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 				return [];
 			}
 			projection?.trackFramedItem(frameId, undefined, toolCallId);
-			projection?.connectFrameRenderer(frameId, () => {
-				try {
-					this.invalidate?.();
-				} catch {
-					// A stale transcript component may already be disposed.
-				}
-			});
+			projection?.connectFrameRenderer(frameId, () => invalidateDecoration(this));
 			projection?.markFrameContentVisible(frameId, true);
 		}
+		const contextLines = interim ? [] : (projection?.getAssistantContextLines(this.lastMessage, expanded) ?? [])
+			.map((line) => truncateToWidth(`  ${resolveAggregateRenderTheme(projection).fg("muted", line)}`, Math.max(0, width), "…"));
 		if (trimmed.length === 0) return contextLines.length > 0 ? ["", ...contextLines] : [];
 		if (!interim) {
 			// Thinking-placeholder cleanup also trims Pi's leading Spacer(1).
@@ -341,6 +378,8 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 		prototype.render = state.patchedRender;
 		prototype.setExpanded = state.patchedSetExpanded;
 	}
+	if (state.originalUpdateContent && prototype.updateContent === state.originalUpdateContent) prototype.updateContent = state.patchedUpdateContent;
+	if (state.originalInvalidate && prototype.invalidate === state.originalInvalidate) prototype.invalidate = state.patchedInvalidate;
 }
 
 export function restoreAggregateThinkingPlaceholders(): void {
@@ -348,9 +387,13 @@ export function restoreAggregateThinkingPlaceholders(): void {
 	const state = prototype[AGGREGATE_THINKING_PATCH_KEY];
 	if (state && state.owner !== THINKING_MODULE) return;
 	restoreAggregateMouseHandling(prototype);
+	bodyLayouts = new WeakMap();
 	if (!state) return;
 	state.renderImpl = state.originalRender;
 	state.onExpanded = undefined;
+	state.onContentChanged = undefined;
+	if (prototype.updateContent === state.patchedUpdateContent) prototype.updateContent = state.originalUpdateContent;
+	if (prototype.invalidate === state.patchedInvalidate) prototype.invalidate = state.originalInvalidate;
 	if (prototype.render === state.patchedRender) {
 		prototype.render = state.originalRender;
 		if (prototype.setExpanded === state.patchedSetExpanded) {

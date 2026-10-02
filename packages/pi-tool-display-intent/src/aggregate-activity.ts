@@ -916,7 +916,8 @@ export function resolveAggregateProjection(
 	for (const hint of hints) {
 		if (typeof hint !== "string" || !hint) continue;
 		for (const projection of liveProjections) {
-			if (projection.getMember(hint) || projection.getFrameEdge(hint)) return projection;
+			// A projection from before /reload may not have the indexed lookup yet.
+			if (projection.getMember(hint) || (projection.hasFramedItem?.(hint) ?? Boolean(projection.getFrameEdge(hint)))) return projection;
 		}
 	}
 	return hostAggregateProjection;
@@ -943,6 +944,7 @@ export class AggregateProjection {
 	private initialized = false;
 	private renderTheme: AggregateRenderTheme | undefined;
 	private readonly contextGrowth = new ContextGrowthLedger();
+	private contextGrowthDisplays = new Map<string, string>();
 	private pulseTimer: ReturnType<typeof setInterval> | undefined;
 	private readonly contextInvalidators = new Map<string, () => void>();
 	private readonly turnIdsByMessage = new WeakMap<object, string>();
@@ -1040,7 +1042,7 @@ export class AggregateProjection {
 	}
 
 	private collapsedHost(group: AggregateGroup): string | undefined {
-		return [...group.framedItemIds].reverse().find((id) => {
+		return group.framedItemIds.findLast((id) => {
 			if (this.customMessages.has(id)) return !this.emptyCustomFrames.has(id);
 			const member = this.membersById.get(id);
 			return member?.visible && member.state !== "needsAttention" && !this.isPassthrough(member.toolName);
@@ -1277,6 +1279,10 @@ export class AggregateProjection {
 		return "continue";
 	}
 
+	hasFramedItem(itemId: string): boolean {
+		return this.framedGroupById.has(itemId) && !this.emptyCustomFrames.has(itemId);
+	}
+
 	getFramedItemIds(itemId: string): string[] {
 		const groupId = this.framedGroupById.get(itemId);
 		return groupId ? (this.groupsById.get(groupId)?.framedItemIds ?? []).filter((id) => !this.emptyCustomFrames.has(id)) : [];
@@ -1306,9 +1312,12 @@ export class AggregateProjection {
 
 	markFrameContentVisible(itemId: string, visible: boolean): void {
 		if (!itemId) return;
+		const custom = this.customMessages.has(itemId);
+		if (this.visibleFrameContent.has(itemId) === visible
+			&& (!custom || this.emptyCustomFrames.has(itemId) === !visible)) return;
 		const previousHost = this.getFramedItemIds(itemId).find((id) => this.hasVisibleFrameContent(id));
 		const group = this.groupForItem(itemId);
-		if (this.customMessages.has(itemId)) {
+		if (custom) {
 			const wasEmpty = this.emptyCustomFrames.has(itemId);
 			if (visible) this.emptyCustomFrames.delete(itemId);
 			else this.emptyCustomFrames.add(itemId);
@@ -1466,8 +1475,8 @@ export class AggregateProjection {
 		if (!groupId) return undefined;
 		const group = this.groupsById.get(groupId);
 		if (!group) return undefined;
-		for (const frameId of [...group.framedItemIds].reverse()) {
-			const narration = group.narrationById.get(frameId);
+		for (let index = group.framedItemIds.length - 1; index >= 0; index--) {
+			const narration = group.narrationById.get(group.framedItemIds[index]!);
 			if (narration) return narration;
 		}
 		return undefined;
@@ -1875,7 +1884,7 @@ export class AggregateProjection {
 	}
 
 	/** Reuse the final branch for live turns and history, never streaming usage. */
-	rebuildContextGrowth(entries: readonly unknown[]): void {
+	rebuildContextGrowth(entries: readonly unknown[], fullInvalidation = true): void {
 		this.contextGrowth.reset();
 		const groupsByTurn = new Map(this.groups.flatMap((group) => group.agentTurnIds.map((id) => [id, group] as const)));
 		let previousGroup: AggregateGroup | undefined;
@@ -1904,13 +1913,34 @@ export class AggregateProjection {
 				this.contextGrowth.breakChain(previousTerminal ? undefined : previousGroup?.groupId);
 			}
 		}
-		this.invalidateAll();
+		this.refreshContextGrowth(fullInvalidation);
+	}
+
+	private refreshContextGrowth(fullInvalidation: boolean): void {
+		const next = new Map<string, string>();
+		for (const group of this.groups) {
+			// Compare the displayed numeric ledger, never serialize transcript bodies.
+			const display = [formatContextGrowth(this.contextGrowth.getRun(group.groupId, group.agentTurnIds)),
+				...group.agentTurnIds.map((id) => formatContextGrowth(this.contextGrowth.getTurn(id)))].join("|");
+			next.set(group.groupId, display);
+			if (fullInvalidation || !this.showContextGrowth() || this.contextGrowthDisplays.get(group.groupId) === display) continue;
+			if (this.isItemExpanded(group.groupId)) {
+				this.invalidateIds(...group.members.map((member) => member.toolCallId), ...group.customItemIds);
+			} else {
+				this.invalidateIds(this.collapsedHost(group));
+			}
+			for (const id of group.agentTurnIds) {
+				try { this.contextInvalidators.get(id)?.(); } catch { /* Disposed transcript component. */ }
+			}
+		}
+		this.contextGrowthDisplays = next;
+		if (fullInvalidation) this.invalidateAll();
 	}
 
 	finishContextTurn(message: unknown, toolResults: readonly unknown[], entries?: readonly unknown[]): void {
 		this.ingestAssistantMessage(message);
 		if (entries) {
-			this.rebuildContextGrowth(entries);
+			this.rebuildContextGrowth(entries, false);
 			return;
 		}
 		const id = this.contextTurnId(message);
@@ -1918,7 +1948,7 @@ export class AggregateProjection {
 		if (!id || !group) return;
 		this.contextGrowth.recordAssistant(group.groupId, id, message);
 		for (const result of toolResults) this.contextGrowth.recordToolResult(result);
-		this.invalidateAll();
+		this.refreshContextGrowth(false);
 	}
 
 	connectContextRenderer(message: unknown, invalidate: () => void): void {
