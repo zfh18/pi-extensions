@@ -378,16 +378,18 @@ function buildCollapsedBashCallText(
 }
 
 export class BashCallComponent implements Component {
-	private renderedContent?: string;
+	private renderedWidth?: number;
 	private renderedText?: Text;
 
 	constructor(private viewState: BashCallViewState) {}
 
 	update(viewState: BashCallViewState): void {
 		this.viewState = viewState;
+		this.invalidate();
 	}
 
 	render(width: number): string[] {
+		if (this.renderedText && this.renderedWidth === width) return this.renderedText.render(width);
 		const {
 			args,
 			theme,
@@ -421,19 +423,14 @@ export class BashCallComponent implements Component {
 			context,
 			spinnerFrame,
 		);
-		if (!this.renderedText) {
-			this.renderedText = new Text(content, 0, 0);
-			this.renderedContent = content;
-		} else if (this.renderedContent !== content) {
-			this.renderedText.setText(content);
-			this.renderedContent = content;
-		}
+		this.renderedText = new Text(content, 0, 0);
+		this.renderedWidth = width;
 		return this.renderedText.render(width);
 	}
 
 	invalidate(): void {
 		this.renderedText?.invalidate();
-		this.renderedContent = undefined;
+		this.renderedWidth = undefined;
 		this.renderedText = undefined;
 	}
 }

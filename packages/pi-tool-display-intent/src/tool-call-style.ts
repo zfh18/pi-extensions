@@ -76,6 +76,8 @@ export interface ClaudeToolResultStyleOptions {
 }
 
 export class ClaudeToolResultComponent implements Component {
+	private cached?: { width: number; childLines: string[]; lines: string[] };
+
 	constructor(
 		private readonly child: Component,
 		private readonly options: ClaudeToolResultStyleOptions = {},
@@ -95,14 +97,16 @@ export class ClaudeToolResultComponent implements Component {
 			visibleWidth(lastPrefix),
 		);
 		const contentWidth = Math.max(1, width - prefixWidth);
+		// Poll the child: live components may change without invalidating this wrapper.
 		const childLines = this.child.render(contentWidth);
-		const firstContentLine = childLines.findIndex((line) => visibleWidth(line) > 0);
-		if (firstContentLine < 0) {
-			return [];
+		const cached = this.cached;
+		if (cached?.width === width && childLines.length === cached.childLines.length
+			&& childLines.every((line, index) => line === cached.childLines[index])) {
+			return cached.lines;
 		}
-
+		const firstContentLine = childLines.findIndex((line) => visibleWidth(line) > 0);
 		const lastContentLine = childLines.length - 1;
-		return childLines.map((rawLine, index) => {
+		const lines = firstContentLine < 0 ? [] : childLines.map((rawLine, index) => {
 			const plainPrefix = index === firstContentLine
 				? (this.options.connectRows && firstContentLine === lastContentLine ? lastPrefix : firstPrefix)
 				: (index === lastContentLine ? lastPrefix : continuationPrefix);
@@ -110,9 +114,13 @@ export class ClaudeToolResultComponent implements Component {
 			const line = index === firstContentLine ? stripLegacyResultMarker(rawLine) : rawLine;
 			return truncateToWidth(`${prefix}${line}`, width, "");
 		});
+		// Snapshot rows in case the child mutates its returned array in place.
+		this.cached = { width, childLines: [...childLines], lines };
+		return lines;
 	}
 
 	invalidate(): void {
+		this.cached = undefined;
 		this.child.invalidate();
 	}
 }

@@ -108,6 +108,53 @@ function createExtensionApiStub(allTools: unknown[] = []): {
 	return { api, registeredTools, eventHandlers };
 }
 
+for (const name of ["bash", "write"] as const) {
+	test(`completed ${name} caches the full native tool rendering chain and refreshes live changes`, () => {
+		initTheme("dark", false);
+		const { api, registeredTools } = createExtensionApiStub();
+		registerToolDisplayOverrides(api, () => DEFAULT_TOOL_DISPLAY_CONFIG);
+		const tool = registeredTools.find((tool) => tool.name === name)!;
+		let callPaints = 0;
+		let resultPaints = 0;
+		const countPaints = (render: (...args: unknown[]) => unknown, themeIndex: number, count: () => void) =>
+			(...args: unknown[]) => {
+				const theme = args[themeIndex] as { fg(color: string, text: string): string };
+				const countedTheme = Object.create(theme);
+				countedTheme.fg = (color: string, text: string) => { count(); return theme.fg(color, text); };
+				args[themeIndex] = countedTheme;
+				return render(...args);
+			};
+		tool.renderCall = countPaints(tool.renderCall!, 1, () => { callPaints++; });
+		tool.renderResult = countPaints(tool.renderResult!, 2, () => { resultPaints++; });
+		const args = name === "bash"
+			? { command: "printf first\nprintf second", displaySummary: "Check cached output" }
+			: { path: "cache-check.ts", content: Array.from({ length: 30 }, (_, i) => `const item${i} = '中文';`).join("\n") };
+		const component = new ToolExecutionComponent(name, `cache-${name}`, args, {}, tool as never,
+			{ requestRender() {} } as never, process.cwd());
+		component.updateResult({ content: [{ type: "text", text: "\x1b[32mResult 中文 👩‍💻\x1b[0m\nnext line" }], isError: false });
+		const first = component.render(80);
+		callPaints = resultPaints = 0;
+		for (let i = 0; i < 10; i++) assert.deepEqual(component.render(80), first);
+		assert.equal(resultPaints, 0, "the outer result wrapper must also hit its cache");
+		if (name === "bash") assert.equal(callPaints, 0, "Bash headers must skip presentation work");
+		assert.ok(component.render(36).every((line) => visibleWidth(line) <= 36));
+		assert.ok(resultPaints > 0);
+		component.setExpanded(true);
+		const expanded = component.render(80);
+		assert.notDeepEqual(expanded, first);
+		component.setExpanded(false);
+		assert.deepEqual(component.render(80), first);
+		component.invalidate();
+		resultPaints = 0;
+		assert.deepEqual(component.render(80), first);
+		assert.ok(resultPaints > 0);
+		component.updateResult({ content: [{ type: "text", text: "live replacement" }], isError: false }, true);
+		assert.match(component.render(80).join("\n"), name === "bash" ? /live replacement/ : /writing\.\.\./);
+		component.updateResult({ content: [{ type: "text", text: "failed replacement" }], isError: true });
+		assert.match(component.render(80).join("\n"), /failed replacement/);
+	});
+}
+
 test("registerToolDisplayOverrides copies built-in prompt metadata onto overridden tools", async () => {
 	const { api, registeredTools, eventHandlers } = createExtensionApiStub();
 

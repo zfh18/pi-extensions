@@ -286,6 +286,40 @@ test("renderBashCall uses accent for model intent and muted for fallback intent"
 	assert.match(renderedText(fallbackIntent), /<muted>Run command<\/muted>/);
 });
 
+test("Bash call skips unchanged presentation work but refreshes on update, width and invalidate", () => {
+	let paints = 0;
+	let color = 90;
+	const theme = {
+		fg: (_: string, text: string) => { paints++; return `\x1b[${color}m${text}\x1b[0m`; },
+		bold: (text: string) => text,
+	};
+	const args = { command: "printf first\nprintf second", displaySummary: "Initial intent" };
+	const context = makeContext();
+	const intent = { language: "en" as const, maxLength: 96 };
+	const component = renderBashCall(args, theme, context, intent, "claude");
+	const first = component.render(80);
+	paints = 0;
+	for (let i = 0; i < 10; i++) assert.deepEqual(component.render(80), first);
+	assert.equal(paints, 0, "no presentation work before a late Text cache hit");
+	component.render(32);
+	assert.ok(paints > 0);
+	assert.ok(component.render(32).every((line) => visibleWidth(line) <= 32));
+
+	color = 31;
+	component.invalidate();
+	assert.notDeepEqual(component.render(80), first);
+	args.command = "echo changed\nprintf tail";
+	args.displaySummary = "Updated intent";
+	const expanded = renderBashCall(args, theme, { ...context, lastComponent: component, expanded: true }, intent, "claude");
+	assert.equal(expanded, component);
+	const text = expanded.render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+	assert.match(text, /echo changed/);
+	assert.match(text, /printf tail/);
+	assert.match(text, /Updated intent/);
+	renderBashCall(args, theme, { ...context, lastComponent: component }, intent, "claude");
+	assert.doesNotMatch(component.render(80).join("\n"), /printf tail/);
+});
+
 // ─── Context States ──────────────────────────────────────────────────────────
 
 test("renderBashCall no spinner when executionStarted is false", () => {

@@ -1,11 +1,13 @@
 // Run from this package: node --import tsx scripts/benchmark-render-cache.ts
 // In-memory terminal: measures JS rendering/input latency, not terminal I/O.
 import { performance } from "node:perf_hooks";
-import { AssistantMessageComponent, ToolExecutionComponent, initTheme } from "@earendil-works/pi-coding-agent";
+import { AssistantMessageComponent, ToolExecutionComponent, initTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Container, ScrollView, Text, TuiAltScreen, VStack } from "@earendil-works/pi-tui";
 import { AggregateProjection, patchAggregateToolExecutions, restoreAggregateToolExecutions } from "../src/aggregate-activity.ts";
 import { patchAggregateThinkingPlaceholders, restoreAggregateThinkingPlaceholders } from "../src/aggregate-thinking-placeholder.ts";
 import { PreviewText } from "../src/preview-text.ts";
+import { registerToolDisplayOverrides } from "../src/tool-overrides.ts";
+import { DEFAULT_TOOL_DISPLAY_CONFIG } from "../src/types.ts";
 
 initTheme("dark", false);
 const width = 100;
@@ -65,6 +67,34 @@ try {
 			maxRows: 8, expanded: false, theme: { fg: (_, text) => text },
 		}));
 		console.log(JSON.stringify({ case: "output previews", n, ...measure(() => root.render(width)) }));
+	}
+	// Include the real result wrappers and Bash headers, not just bare PreviewText.
+	const tools = new Map<string, Parameters<ExtensionAPI["registerTool"]>[0]>();
+	registerToolDisplayOverrides({
+		registerTool: (tool) => { tools.set(tool.name, tool); },
+		on() {}, getAllTools: () => [],
+	} as unknown as ExtensionAPI, () => DEFAULT_TOOL_DISPLAY_CONFIG);
+	for (const n of [300, 1000]) {
+		document.clear();
+		for (let i = 0; i < n; i++) {
+			const name = i % 10 === 0 ? "write" : "bash";
+			const args = name === "bash"
+				? { command: "printf first\nprintf second", displaySummary: "Check historical output" }
+				: { path: `cache-${i}.ts`, content: Array.from({ length: 30 }, (_, row) => `const item${row} = '中文';`).join("\n") };
+			const tool = new ToolExecutionComponent(name, `individual-${i}`, args, {}, tools.get(name),
+				{ requestRender() {} } as never, process.cwd());
+			tool.updateResult({ content: [{ type: "text", text: Array.from({ length: 8 }, (_, row) =>
+				`Result ${i}/${row} ` + "output 中文 👩‍💻 ".repeat(6)).join("\n") }], isError: false });
+			document.addChild(tool);
+		}
+		runtime.stopped = false;
+		const frame = measure(() => runtime.doRender());
+		await input("warmup");
+		const inputs: number[] = [];
+		for (let i = 0; i < 7; i++) inputs.push(await input(String(i)));
+		console.log(JSON.stringify({ case: "individual tools, full native chain, fullscreen 100x30", n, ...frame,
+			inputToPaintMedianMs: +inputs.sort((a, b) => a - b)[3]!.toFixed(2) }));
+		runtime.stopped = true;
 	}
 	for (const [n, narration] of [[300, true], [2000, false]] as const) {
 		const projection = new AggregateProjection();
