@@ -65,12 +65,14 @@ pi install npm:@zhcsyncer/pi-extensions
   › 先对照两边入口
   ● Bash — 把策略固化成 zone · 54 lines · 2.3KB           12s
 
+▎ 先确定方案
+▎ 保留现有配置
+
 ● Run (38 calls · 3 turns) · read ×12 · ask_user_question ×1 · edit ×8 · bash ×17
-  ↳ 2 steers
   took 2m14s · tok ↑62k ↓8.4k R120k W4.1k · at 2026-04-08 14:32:14
 ```
 
-进行中时，最新一条 assistant 旁白按 Markdown 停在标题下，最多三行。每条可见调用把耗时靠右放在首行，目标过长时最多再占一行。结束后旁白收起，mute 收据显示耗时、token、cache 和本地时间。收起时失败只显示 `N failed`。中途 steer 仍是同一本 Run：进行中钉各条首行，结束后留一行 `↳ N steers`。`Ctrl+O` 展开原时间线，每条 `↳` 留在当时的位置，每条调用最多 8 行；失败详情另起缩进行。默认 `flat` 仍是逐条带时间；把 `toolCalls.expandedTimeline` 调成 `turns` 后，按拍显示 `↻ 1/3 · 3 calls` 拍头，调用行缩进，不用 reload。多行 bash 只显示 intent 和体积，不倒脚本。Agent 和 consult 使用同样的紧凑调用行。图片 read 像其它 output 一样收进 Run 账本。切回：`/tools individual`。
+进行中时，最新一条 assistant 旁白按 Markdown 停在标题下，最多三行。每条可见调用把耗时靠右放在首行，目标过长时最多再占一行。结束后旁白收起，mute 收据显示耗时、token、cache 和本地时间。收起时失败只显示 `N failed`。中途 steer 始终作为独立用户消息留在原插入位置，不随 Run 折叠。前后工具分别留在各自的 Run 块中，各自计数和开合，前段调用不会移到后来的指令下面；它们仍属于同一请求。摘要不重复 steer 正文或计数。steer 插入后，前段 Run 的已完成调用预览立即收起，不再等待后段结束；仍在执行的调用保留到自身结束。`Ctrl+O` 展开工具时间线，每条调用最多 8 行；失败详情另起缩进行。默认 `flat` 仍是逐条带时间；把 `toolCalls.expandedTimeline` 调成 `turns` 后，按拍显示 `↻ 1/3 · 3 calls` 拍头，调用行缩进，不用 reload。多行 bash 只显示 intent 和体积，不倒脚本。Agent 和 consult 使用同样的紧凑调用行。图片 read 像其它 output 一样收进 Run 账本。切回：`/tools individual`。
 
 用户行固定用左侧强调色细杠。
 
@@ -102,7 +104,7 @@ pi install npm:@zhcsyncer/pi-extensions
 
 账本只有在完整目标能放进一行时才显示 `Bash(command)`。超长或多行命令只显示 Bash、intent 和体积；点击展开后的调用查看完整参数。
 
-展开的 steer 按终端宽度换行：不超过 8 行内容时完整显示，超过后保留头 3 行、尾 2 行，中间显示 `… N lines hidden · click to view`。点击省略行查看原始消息。收起态仍每条一行。
+steer 消息按终端宽度换行：不超过 8 行内容时完整显示，超过后保留头 3 行、尾 2 行，中间显示 `… N lines hidden · click to view`。点击省略行查看原始消息。Run 开合与 `Ctrl+O` 不改变此预览；Pi 的上一条／下一条消息快捷键仍可跳到每条 steer。
 
 ### 上下文增长
 

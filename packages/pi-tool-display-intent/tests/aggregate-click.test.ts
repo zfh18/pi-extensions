@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent, UserMessageComponent, initTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Container, Text, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { AggregateProjection, patchAggregateToolExecutions, restoreAggregateToolExecutions } from "../src/aggregate-activity.ts";
 import { patchAggregateThinkingPlaceholders, restoreAggregateThinkingPlaceholders } from "../src/aggregate-thinking-placeholder.ts";
 import registerNativeUserMessageBox from "../src/user-message-box-native.ts";
 import { DEFAULT_TOOL_DISPLAY_CONFIG } from "../src/types.ts";
+import { hasPromptZoneStart } from "../src/prompt-zone-markers.ts";
 import type { DetailRequest } from "../src/detail-viewer.ts";
 
 const plain = { fg: (_: string, text: string) => text, bold: (text: string) => text };
@@ -247,7 +248,83 @@ for (const shell of ["self", "default"] as const) test(`passthrough ${shell}: na
 	} finally { restoreAggregateToolExecutions(); }
 });
 
-for (const lineCount of [30, 3000]) test(`${lineCount}-line steer follows its run and only its omission row opens the original message`, async () => {
+for (const replay of [false, true]) test(`${replay ? "replayed" : "live"} steers stay independent of local and global Run folding`, async () => {
+	initTheme("dark", false);
+	const p = new AggregateProjection(() => false);
+	p.setRenderTheme(plain);
+	const branch = [user("u", "request", 1), entry("a", assistant("a", "read")), entry("ra", result("a", "read")),
+		user("steer-1", "first adjustment", 2), user("steer-2", "second adjustment", 3), entry("b", assistant("b", "bash"))];
+	if (replay) p.rebuild(branch);
+	else for (const { message } of branch) {
+		const role = (message as { role: string }).role;
+		if (role === "user") p.ingestUserMessage(message);
+		else if (role === "assistant") p.ingestAssistantMessage(message);
+		else p.ingestToolResult(message);
+	}
+	patchAggregateToolExecutions(p);
+	const handlers = new Map<string, Array<(event: any) => unknown>>();
+	const api = { on(name: string, callback: (event: any) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), callback]); } } as unknown as ExtensionAPI;
+	registerNativeUserMessageBox(api, () => ({ ...DEFAULT_TOOL_DISPLAY_CONFIG, toolCallLayout: "aggregate" }));
+	try {
+		const root = new Container();
+		const first = tool("read", "a");
+		const second = tool("bash", "b");
+		const steers = [new UserMessageComponent("first adjustment"), new UserMessageComponent("second adjustment")];
+		const spacers = steers.map(() => new Spacer(1));
+		root.addChild(first);
+		steers.forEach((steer, i) => { root.addChild(spacers[i]); root.addChild(steer); });
+		root.addChild(second);
+		const assertIndependent = (turnCount = 2) => {
+			for (const width of [40, 100]) {
+				const lines = root.render(width);
+				const text = clean(lines.join("\n"));
+				assert.equal((text.match(/first adjustment/g) ?? []).length, 1);
+				assert.equal((text.match(/second adjustment/g) ?? []).length, 1);
+				assert.ok(text.indexOf("first adjustment") < text.indexOf("second adjustment"));
+				if (p.isItemExpanded("a")) {
+					const earlierTool = text.indexOf("Read(a.ts)");
+					assert.notEqual(earlierTool, -1);
+					assert.ok(earlierTool < text.indexOf("first adjustment"));
+					assert.ok(text.indexOf("second adjustment") < text.indexOf("Bash"));
+				}
+				assert.doesNotMatch(clean([...first.render(width), ...second.render(width)].join("\n")), /adjustment|steers|↳/);
+				for (const steer of steers) {
+					const rows = steer.render(width);
+					assert.ok(hasPromptZoneStart(rows), "standalone user messages stay navigable");
+					assert.match(clean(rows.join("\n")), /▎ (first|second) adjustment/);
+					assert.doesNotMatch(clean(rows.join("\n")), /Run|│|└|↳/);
+				}
+				assert.ok(spacers.every((spacer) => spacer.render(width).length === 1));
+			}
+			assert.equal(p.getGroups().length, 1);
+			assert.equal(p.getViewForGroup("a")?.callCount, 2);
+			assert.equal(p.getViewForGroup("a")?.agentTurnCount, turnCount);
+			assert.equal(p.getViewForGroup("a")?.steerCount, 2);
+			for (const steer of p.getGroups()[0].steers) {
+				assert.equal(p.hasFramedItem(steer.id), false);
+				assert.equal(p.getViewportRun(steer.id), undefined, "user messages are not viewport folding targets");
+			}
+		};
+		assertIndependent();
+		p.toggleGroupExpansion("a");
+		assertIndependent();
+		const mode = { toolOutputExpanded: false, loadedResourcesContainer: new Container(), chatContainer: root, showStatus() {} };
+		const setToolsExpanded = (InteractiveMode.prototype as unknown as { setToolsExpanded(expanded: boolean): void }).setToolsExpanded;
+		for (const expanded of [false, true, false]) {
+			setToolsExpanded.call(mode, expanded);
+			assertIndependent();
+		}
+		p.markGroupSettled();
+		assertIndependent();
+		p.rebuild([...branch, entry("rb", result("b", "bash")), final("u")]);
+		assertIndependent(3);
+	} finally {
+		for (const handler of handlers.get("session_shutdown") ?? []) await handler({ reason: "reload" });
+		restore();
+	}
+});
+
+for (const lineCount of [30, 3000]) test(`${lineCount}-line steer stays visible and only its omission row opens the original message`, async () => {
 	initTheme("dark", false);
 	const p = new AggregateProjection(() => false, () => "turns");
 	p.setRenderTheme(plain);
@@ -262,10 +339,13 @@ for (const lineCount of [30, 3000]) test(`${lineCount}-line steer follows its ru
 	p.setDetailOpener(async (request) => { opened.push(request); });
 	try {
 		const component = new UserMessageComponent(steerText);
-		assert.deepEqual(component.render(100), []);
+		const collapsed = component.render(100);
+		assert.equal(collapsed.length, 8);
 		p.toggleGroupExpansion("a");
 		const lines = component.render(100);
-		assert.equal(lines.length, 8);
+		assert.deepEqual(lines, collapsed);
+		assert.match(clean(lines.join("\n")), /▎ steer line 1/);
+		assert.doesNotMatch(clean(lines.join("\n")), /Run|│|└|↳/);
 		assert.match(clean(lines.join("\n")), new RegExp(`steer line 1[\\s\\S]*steer line 3[\\s\\S]*${lineCount - 5} lines hidden[\\s\\S]*steer line ${lineCount - 1}[\\s\\S]*steer line ${lineCount}`));
 		const omitted = lines.findIndex((line) => clean(line).includes("lines hidden"));
 		assert.equal(component.handleMouse(click(95, 1, lines.length)), undefined);
@@ -273,7 +353,7 @@ for (const lineCount of [30, 3000]) test(`${lineCount}-line steer follows its ru
 		assert.deepEqual(opened, [{ kind: "steer", text: steerText }]);
 		assert.ok(component.render(4).length <= 8, "tiny viewports cannot bypass the steer budget");
 		p.toggleGroupExpansion("a");
-		assert.deepEqual(component.render(100), []);
+		assert.deepEqual(component.render(100), collapsed);
 	} finally {
 		for (const handler of handlers.get("session_shutdown") ?? []) await handler({ reason: "reload" });
 		restore();

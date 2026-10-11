@@ -15,9 +15,7 @@ import {
   extractUserMessageMarkdownState,
 } from "../src/user-message-box-markdown.ts";
 import {
-  patchSteerUserLeadingSpacer,
   resolveAggregateSteerUserPresentation,
-  restoreSteerUserLeadingSpacer,
 } from "../src/user-message-box-native.ts";
 import {
   patchUserMessageRenderPrototype,
@@ -36,6 +34,13 @@ import {
   normalizeUserMessageContentLines,
   type UserMessageBackgroundTheme,
 } from "../src/user-message-box-utils.ts";
+import {
+  OSC133_ZONE_END,
+  OSC133_ZONE_FINAL,
+  OSC133_ZONE_START,
+  hasPromptZoneStart,
+  stripPromptZone,
+} from "../src/prompt-zone-markers.ts";
 
 // ===========================================================================
 // Issue #10: OSC 133 prompt marker stripping
@@ -721,7 +726,7 @@ test("nativeRender produces top margin spacer and border when enabled and width 
   };
   patchNativeUserMessagePrototype(prototype, () => undefined, () => true);
   const rendered = prototype.render(40);
-  assert.equal(rendered[0], "", "first line is top margin spacer");
+  assert.equal(stripPromptZone(rendered)[0], "", "first line is top margin spacer");
   assert.ok(rendered[1]?.includes("╭"), "second line has top border");
   assert.ok(rendered.some((l) => l.includes("│")), "has content border lines");
   assert.ok(rendered.some((l) => l.includes("╰")), "has bottom border");
@@ -924,7 +929,7 @@ test("nativeRender builds correct box structure with all required line types", (
   assert.equal(rendered.filter((l) => l.includes("╭") || l.includes("╰")).length, 2);
 });
 
-test("aggregate collapsed steer user boxes render at zero height", () => {
+test("aggregate steer user boxes remain visible independently of Run expansion", () => {
   const prototype: PatchableUserMessagePrototype = {
     render: () => ["先确定方案"],
   };
@@ -933,12 +938,13 @@ test("aggregate collapsed steer user boxes render at zero height", () => {
     () => undefined,
     () => true,
     () => true,
-    () => ({ hide: true }),
+    () => ({ lines: ["▎ 先确定方案"] }),
   );
-  assert.deepEqual(prototype.render(40), []);
+  assert.match(prototype.render(40).join("\n"), /▎ 先确定方案/);
+  assert.equal(prototype.setExpanded, undefined);
 });
 
-test("aggregate expanded steer user boxes use an accent ↳ instead of the task gutter", () => {
+test("aggregate steer user boxes use the user gutter instead of the Run frame", () => {
   const prototype: PatchableUserMessagePrototype = {
     render: () => ["先确定方案"],
   };
@@ -947,11 +953,11 @@ test("aggregate expanded steer user boxes use an accent ↳ instead of the task 
     () => undefined,
     () => true,
     () => true,
-    () => ({ lines: ["  │ ↳ 先确定方案"] }),
+    () => ({ lines: ["▎ 先确定方案"] }),
   );
   const rendered = prototype.render(40);
-  assert.match(rendered.join("\n"), /↳ 先确定方案/);
-  assert.doesNotMatch(rendered.join("\n"), /▎/);
+  assert.match(rendered.join("\n"), /▎ 先确定方案/);
+  assert.doesNotMatch(rendered.join("\n"), /↳|│|└/);
   assert.doesNotMatch(rendered.join("\n"), /╭|╰/);
 });
 
@@ -980,20 +986,19 @@ test("individual user boxes ignore aggregate steer presentation", () => {
     () => undefined,
     () => true,
     () => false,
-    () => ({ hide: true }),
+    () => ({ lines: ["unused"] }),
   );
   const rendered = prototype.render(40);
   assert.ok(rendered.some((line) => line.includes("╭")));
   assert.match(rendered.join("\n"), /先确定方案/);
 });
 
-test("steer users collapse the leading Pi spacer so the expanded frame stays continuous", () => {
+test("steer users keep the native spacer and stay outside the Run frame", () => {
   initTheme("dark", false);
   const projection = new AggregateProjection((toolName) =>
     (DEFAULT_AGGREGATE_RENDER_PASSTHROUGH as readonly string[]).includes(toolName));
   const userPrototype = UserMessageComponent.prototype as unknown as PatchableUserMessagePrototype;
   patchAggregateToolExecutions(projection);
-  patchSteerUserLeadingSpacer();
   patchNativeUserMessagePrototype(
     userPrototype,
     () => undefined,
@@ -1015,20 +1020,16 @@ test("steer users collapse the leading Pi spacer so the expanded frame stays con
     container.addChild(new Text("above", 0, 0));
     container.addChild(spacer);
     container.addChild(user);
-    (user as UserMessageComponent & { setExpanded(expanded: boolean): void }).setExpanded(true);
     const rendered = container.render(80);
     const join = rendered.join("\n");
     assert.match(join, /above/);
-    assert.match(join, /↳.*先确定方案/);
+    assert.match(join, /▎.*先确定方案/);
+    assert.doesNotMatch(join, /│|└|↳/);
     const above = rendered.findIndex((line) => line.includes("above"));
-    const steer = rendered.findIndex((line) => line.includes("↳"));
+    const steer = rendered.findIndex((line) => line.includes("先确定方案"));
     assert.ok(above >= 0 && steer > above);
-    assert.ok(
-      rendered.slice(above + 1, steer).every((line) => line.includes("│")),
-      "no unframed blank between the previous row and ↳",
-    );
+    assert.equal(spacer.render(80).length, 1);
   } finally {
-    restoreSteerUserLeadingSpacer();
     unregisterUserMessageRenderPrototypePatch(userPrototype);
     restoreAggregateToolExecutions();
   }
@@ -1044,10 +1045,111 @@ test("unregistering the user message patch restores the original renderer", () =
     () => undefined,
     () => true,
     () => true,
-    () => ({ hide: true }),
+    () => ({ lines: ["▎ steer override"] }),
   );
-  assert.deepEqual(prototype.render(40), []);
+  assert.match(prototype.render(40).join("\n"), /steer override/);
   unregisterUserMessageRenderPrototypePatch(prototype);
   assert.deepEqual(prototype.render(40), ["orig"]);
   assert.equal(prototype.setExpanded, undefined);
+});
+
+// ===========================================================================
+// Prompt zone markers: rebuilt user message rows must stay navigable
+// pi-tui's fullscreen transcript finds prompt boundaries with
+// /^\x1b\]133;A(?:\x07|\x1b\\)/ against each rendered row, and pi core marks
+// every non-empty user message render. The rebuilt box rows carry no markers,
+// so the patch re-emits them; the rows themselves must not change.
+// ===========================================================================
+
+// Captured from the unmarked (pre-fix) renderer at width 20.
+const UNMARKED_BOX_ROWS = [
+  "",
+  "╭ user ────────────╮",
+  "│                  │",
+  "│ hello world      │",
+  "│                  │",
+  "╰──────────────────╯",
+];
+const UNMARKED_COMPACT_ROWS = [
+  "▎                   ",
+  "▎ hello world       ",
+  "▎                   ",
+];
+
+function renderPatchedUserMessage(
+  width: number,
+  options: {
+    original?: () => string[];
+    compact?: boolean;
+    steer?: { lines: string[] };
+  } = {},
+): string[] {
+  const prototype: PatchableUserMessagePrototype = {
+    render: options.original ?? (() => ["hello world"]),
+  };
+  patchNativeUserMessagePrototype(
+    prototype,
+    () => undefined,
+    () => true,
+    () => options.compact === true,
+    options.steer ? () => options.steer as never : undefined,
+  );
+  try {
+    return prototype.render(width);
+  } finally {
+    unregisterUserMessageRenderPrototypePatch(prototype);
+  }
+}
+
+test("user message box render starts with the A marker and ends with B+C", () => {
+  const rendered = renderPatchedUserMessage(20);
+  assert.ok(hasPromptZoneStart(rendered), "first row must start with OSC133 A");
+  assert.ok(
+    rendered[rendered.length - 1].startsWith(OSC133_ZONE_END + OSC133_ZONE_FINAL),
+    "last row must start with OSC133 B + C",
+  );
+});
+
+test("user message box rows are unchanged after stripping the zone markers", () => {
+  assert.deepEqual(stripPromptZone(renderPatchedUserMessage(20)), UNMARKED_BOX_ROWS);
+});
+
+test("user message compact render is marked and otherwise unchanged", () => {
+  const rendered = renderPatchedUserMessage(20, { compact: true });
+  assert.ok(hasPromptZoneStart(rendered));
+  assert.ok(rendered[rendered.length - 1].startsWith(OSC133_ZONE_END + OSC133_ZONE_FINAL));
+  assert.deepEqual(stripPromptZone(rendered), UNMARKED_COMPACT_ROWS);
+});
+
+test("user message cache hit keeps exactly one zone marker", () => {
+  const prototype: PatchableUserMessagePrototype = {
+    render: () => ["hello world"],
+  };
+  patchNativeUserMessagePrototype(prototype, () => undefined, () => true);
+  try {
+    const first = prototype.render(20);
+    const second = prototype.render(20);
+    assert.deepEqual(first, second);
+    assert.equal(second[0].split(OSC133_ZONE_START).length - 1, 1);
+    assert.equal(second[1].split(OSC133_ZONE_START).length - 1, 0);
+  } finally {
+    unregisterUserMessageRenderPrototypePatch(prototype);
+  }
+});
+
+test("user message steer presentation lines are marked, empty layouts stay empty", () => {
+  const steer = renderPatchedUserMessage(20, { compact: true, steer: { lines: ["steer line"] } });
+  assert.ok(hasPromptZoneStart(steer));
+  assert.deepEqual(stripPromptZone(steer), ["steer line"]);
+
+  assert.deepEqual(
+    renderPatchedUserMessage(20, { compact: true, steer: { lines: [] } }),
+    [],
+  );
+});
+
+test("user message passthrough renders keep pi's own markers untouched", () => {
+  const markedOriginal = () => [OSC133_ZONE_START + "orig", OSC133_ZONE_END + OSC133_ZONE_FINAL + "row"];
+  const rendered = renderPatchedUserMessage(7, { original: markedOriginal });
+  assert.deepEqual(rendered, markedOriginal());
 });

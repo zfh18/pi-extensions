@@ -64,6 +64,33 @@ test("native replay consumes hidden slots and preserves duplicate occurrence ide
 	assert.match(clean(cards[1].render(80)), /same/);
 });
 
+test("custom summaries stay in their own steer segment even when a later renderer is empty", (t) => {
+	const f = fixture(t, (message: any) => ({ render: () => message.content === "empty" ? [] : [message.content] }));
+	f.projection.startUserGroup("request");
+	f.projection.markStarted("read", "read", { path: "before.ts" });
+	f.projection.markComplete("read", { content: [] }, false);
+	f.mode.addMessageToChat(custom("before steer"));
+	const first = f.cards()[0];
+	const firstId = f.id(first);
+	f.projection.ingestUserMessage({ role: "user", content: "adjust" }, { streamingBehavior: "steer" });
+	f.mode.addMessageToChat(custom("after steer"));
+	f.mode.addMessageToChat(custom("empty"));
+	const [, second, empty] = f.cards();
+	const secondId = f.id(second);
+	assert.deepEqual(empty.render(80), []);
+	assert.match(clean(first.render(80)), /Run \(1 call/);
+	assert.match(clean(second.render(80)), /Run/);
+	assert.equal(f.projection.getView(firstId)?.callCount, 1);
+	assert.equal(f.projection.getView(secondId)?.callCount, 0);
+	assert.equal(f.projection.getView(secondId)?.customMessageCount, 1);
+	assert.notEqual(f.projection.getViewportRun(firstId), f.projection.getViewportRun(secondId));
+	f.projection.toggleGroupExpansion(secondId);
+	assert.match(clean(second.render(80)), /after steer/);
+	assert.doesNotMatch(clean(second.render(80)), /before steer|read ×1/);
+	assert.equal(f.projection.isItemExpanded(firstId), false);
+	assert.match(clean(first.render(80)), /Run \(1 call/);
+});
+
 test("idle native add path ingests custom-only runs without extension message events", (t) => {
 	const f = fixture(t);
 	const hidden = custom("secret", false);

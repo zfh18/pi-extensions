@@ -197,7 +197,7 @@ export function patchAggregateCustomMessages(): void {
 		let top = 0;
 		const regions: AggregateClickRegion[] = [];
 		if (projection.shouldHostExpandedSummary(id)) {
-			const view = projection.getViewForGroup(id);
+			const view = projection.getSegmentView(id);
 			if (view) {
 				const header = renderExpandedAggregateSummary(view, width, theme);
 				lines = attachExpandedAggregateSummary(header, lines);

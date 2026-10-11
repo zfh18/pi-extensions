@@ -14,6 +14,7 @@ import {
 } from "./aggregate-activity.js";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { patchAggregateMouseHandling, recordAggregateClickRegions, releaseAggregateClickRegions, restoreAggregateMouseHandling } from "./aggregate-interaction.js";
+import { hasPromptZoneStart, markPromptZone, stripPromptZone } from "./prompt-zone-markers.js";
 
 interface PatchableAssistantMessage {
 	render(width: number): string[];
@@ -75,6 +76,7 @@ let bodyLayouts = new WeakMap<PatchableAssistantMessage, {
 	width: number;
 	stripThinking: boolean;
 	label: string;
+	hostMarkedPromptZone: boolean;
 	lines: string[];
 }>();
 
@@ -316,10 +318,13 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 			const lines = stripThinkingBody
 				? renderWithoutThinkingBlocks(this, state.originalRender, narrationWidth)
 				: state.originalRender.call(this, narrationWidth);
-			body = { width: narrationWidth, stripThinking: stripThinkingBody, label,
-				lines: stripCollapsedThinkingPlaceholderLines(lines, label) };
+			const hostMarkedPromptZone = hasPromptZoneStart(lines);
+			// Cache marker-free layout and host marking together; tool-call messages stay unmarked.
+			body = { width: narrationWidth, stripThinking: stripThinkingBody, label, hostMarkedPromptZone,
+				lines: stripCollapsedThinkingPlaceholderLines(hostMarkedPromptZone ? stripPromptZone(lines) : lines, label) };
 			bodyLayouts.set(this, body);
 		}
+		const markHostPromptZone = (lines: string[]): string[] => body.hostMarkedPromptZone ? markPromptZone(lines) : lines;
 		const next = body.lines;
 		const toolCallId = firstToolCallId(this.lastMessage);
 		const frameId = assistantFrameId(this);
@@ -342,7 +347,7 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 		}
 		const contextLines = interim ? [] : (projection?.getAssistantContextLines(this.lastMessage, expanded) ?? [])
 			.map((line) => truncateToWidth(`  ${resolveAggregateRenderTheme(projection).fg("muted", line)}`, Math.max(0, width), "…"));
-		if (trimmed.length === 0) return contextLines.length > 0 ? ["", ...contextLines] : [];
+		if (trimmed.length === 0) return markHostPromptZone(contextLines.length > 0 ? ["", ...contextLines] : []);
 		if (!interim) {
 			// Thinking-placeholder cleanup also trims Pi's leading Spacer(1).
 			// Put that gap back after the user prompt or a passthrough tool.
@@ -350,7 +355,7 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 			// tools in the same user turn cannot steal the blank from earlier text.
 			const stackedOnTools = projection?.assistantFollowsAggregateLedger(this.lastMessage) === true;
 			const body = stackedOnTools || visibleText(next[0] ?? "") === "" ? next : ["", ...next];
-			return [...body, ...contextLines];
+			return markHostPromptZone([...body, ...contextLines]);
 		}
 		const theme = resolveAggregateRenderTheme(projection);
 		const marked = decorateAssistantLines(trimmed, theme);
@@ -359,16 +364,16 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 		const framed = applyAggregateGroupFrame(inner, width, theme, edge);
 		const run = projection?.getViewportRun(frameId);
 		if (projection?.shouldHostExpandedSummary(frameId)) {
-			const headerView = projection.getViewForGroup(frameId);
+			const headerView = projection.getSegmentView(frameId);
 			if (headerView) {
 				const header = renderExpandedAggregateSummary(headerView, width, theme);
 				const lines = attachExpandedAggregateSummary(header, framed);
 				recordAggregateClickRegions(this, width, lines.length, [{ startRow: 1, endRow: 1 + header.length, onClick: () => projection.toggleGroupExpansionFromComponent(frameId, this) }], run ? { run, titleRow: 1 } : undefined);
-				return lines;
+				return markHostPromptZone(lines);
 			}
 		}
 		recordAggregateClickRegions(this, width, framed.length, [], run ? { run } : undefined);
-		return framed;
+		return markHostPromptZone(framed);
 	};
 	Object.defineProperty(prototype, AGGREGATE_THINKING_PATCH_KEY, {
 		configurable: true,

@@ -4,6 +4,15 @@ import { AssistantMessageComponent, initTheme } from "@earendil-works/pi-coding-
 import { AggregateProjection, patchAggregateToolExecutions, restoreAggregateToolExecutions } from "../src/aggregate-activity.ts";
 import { patchAggregateThinkingPlaceholders, restoreAggregateThinkingPlaceholders } from "../src/aggregate-thinking-placeholder.ts";
 import { PreviewText } from "../src/preview-text.ts";
+import { hasPromptZoneStart, OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START } from "../src/prompt-zone-markers.ts";
+
+function assertPromptZone(lines: string[]): void {
+	assert.ok(hasPromptZoneStart(lines), "cached output must start with a prompt marker");
+	assert.ok(lines.at(-1)?.startsWith(OSC133_ZONE_END + OSC133_ZONE_FINAL));
+	for (const marker of [OSC133_ZONE_START, OSC133_ZONE_END, OSC133_ZONE_FINAL]) {
+		assert.equal(lines.join("\n").split(marker).length - 1, 1, "each zone marker must occur exactly once");
+	}
+}
 
 const message = () => ({
 	role: "assistant", id: "cache-message", timestamp: 1, stopReason: "stop",
@@ -42,8 +51,13 @@ test("assistant body is cached, but in-place streaming updates, width and invali
 		const source = message();
 		const component = new AssistantMessageComponent(source as never, true);
 		const first = component.render(80);
+		assertPromptZone(first);
 		updates = markdownRenders = 0;
-		for (let i = 0; i < 20; i++) assert.deepEqual(component.render(80), first);
+		for (let i = 0; i < 20; i++) {
+			const cached = component.render(80);
+			assert.deepEqual(cached, first);
+			assertPromptZone(cached);
+		}
 		assert.equal(updates, 0);
 		assert.equal(markdownRenders, 0);
 		assert.equal((component as any).lastMessage, source);
@@ -51,14 +65,16 @@ test("assistant body is cached, but in-place streaming updates, width and invali
 		source.content[1]!.text = "Streaming replacement";
 		component.updateContent(source as never, true);
 		assert.equal((component as any).isStreaming, true);
-		assert.match(component.render(80).join("\n"), /Streaming replacement/);
+		const streamed = component.render(80);
+		assert.match(streamed.join("\n"), /Streaming replacement/);
+		assertPromptZone(streamed);
 		assert.ok(markdownRenders > 0);
 		markdownRenders = 0;
-		component.render(40);
+		assertPromptZone(component.render(40));
 		assert.ok(markdownRenders > 0);
 		markdownRenders = 0;
 		component.invalidate();
-		component.render(40);
+		assertPromptZone(component.render(40));
 		assert.ok(markdownRenders > 0);
 
 		// Native thinking visibility setters also rebuild through updateContent.
@@ -73,6 +89,30 @@ test("assistant body is cached, but in-place streaming updates, width and invali
 		assert.equal(prototype.updateContent === originalUpdate, false, "restore retains the earlier wrapper");
 		prototype.updateContent = originalUpdate;
 		markdownPrototype.render = originalMarkdown;
+	}
+});
+
+test("cached assistant prompt zones follow host marking when tool calls change", () => {
+	initTheme("dark", false);
+	patchAggregateThinkingPlaceholders(() => true);
+	try {
+		const source = message();
+		const component = new AssistantMessageComponent(source as never, true);
+		assertPromptZone(component.render(80));
+		component.updateContent({ ...source, stopReason: "toolUse", content: [
+			{ type: "text", text: "Reading a file" },
+			{ type: "toolCall", id: "zone-call", name: "read", arguments: { path: "a.ts" } },
+		] } as never);
+		for (let i = 0; i < 2; i++) {
+			const lines = component.render(80);
+			assert.match(lines.join("\n"), /Reading a file/);
+			assert.doesNotMatch(lines.join("\n"), /\x1b\]133;/);
+		}
+		component.updateContent(source as never);
+		assertPromptZone(component.render(80));
+		assertPromptZone(component.render(80));
+	} finally {
+		restoreAggregateThinkingPlaceholders();
 	}
 });
 

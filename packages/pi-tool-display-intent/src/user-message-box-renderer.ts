@@ -22,6 +22,7 @@ import {
   normalizeUserMessageContentLines,
   type UserMessageBackgroundTheme,
 } from "./user-message-box-utils.js";
+import { markPromptZone } from "./prompt-zone-markers.js";
 
 export interface UserMessageTheme extends UserMessageBackgroundTheme {
   fg(color: string, text: string): string;
@@ -59,14 +60,11 @@ const CONTENT_HORIZONTAL_PADDING_COLUMNS = 1;
 const USER_MESSAGE_TOP_MARGIN_LINES = 1;
 const AGGREGATE_USER_GUTTER = "▎";
 const AGGREGATE_USER_GUTTER_GAP = " ";
-const USER_MESSAGE_PATCH_VERSION = 16;
-export const USER_MESSAGE_EXPANDED_KEY = Symbol.for(
-  "pi-tool-display-intent.aggregate-user-expanded.v1",
-);
+const USER_MESSAGE_PATCH_VERSION = 17;
 
-export type UserMessageSteerPresentation =
-  | { hide: true }
-  | { hide?: false; lines: string[] };
+export interface UserMessageSteerPresentation {
+  lines: string[];
+}
 const MAX_USER_MESSAGE_MARKDOWN_TEXT_LENGTH = 100_000;
 const MAX_USER_MESSAGE_MARKDOWN_LINE_COUNT = 2_000;
 
@@ -152,7 +150,7 @@ function colorThemeText(
   }
 }
 
-function wrapAggregatePromptLine(
+export function wrapAggregatePromptLine(
   line: string,
   totalWidth: number,
   theme: UserMessageTheme | undefined,
@@ -392,25 +390,6 @@ function renderUserMessageBodyLines(
   }
 }
 
-export function isUserMessageExpanded(instance: object): boolean {
-  return (instance as { [USER_MESSAGE_EXPANDED_KEY]?: boolean })[USER_MESSAGE_EXPANDED_KEY] === true;
-}
-
-function installUserMessageSetExpanded(prototype: PatchableUserMessagePrototype): void {
-  if (prototype.__piUserMessageSetExpandedPatched) return;
-  prototype.__piUserMessageOriginalSetExpanded = prototype.setExpanded;
-  prototype.setExpanded = function setAggregateUserMessageExpanded(this: PatchableUserMessagePrototype, expanded: boolean): void {
-    (this as { [USER_MESSAGE_EXPANDED_KEY]?: boolean })[USER_MESSAGE_EXPANDED_KEY] = expanded === true;
-    prototype.__piUserMessageOriginalSetExpanded?.call(this, expanded);
-    try {
-      this.invalidate?.();
-    } catch {
-      // A stale transcript component may already be disposed.
-    }
-  };
-  prototype.__piUserMessageSetExpandedPatched = true;
-}
-
 export function patchNativeUserMessagePrototype(
   prototype: PatchableUserMessagePrototype,
   getTheme: () => UserMessageTheme | undefined,
@@ -420,7 +399,6 @@ export function patchNativeUserMessagePrototype(
 ): void {
   const finalOutputCache = new WeakMap<object, CachedUserMessageFinalOutput>();
   const originalBodyLineCache = new WeakMap<object, CachedUserMessageBodyLines>();
-  installUserMessageSetExpanded(prototype);
 
   patchUserMessageRenderPrototype(
     prototype,
@@ -431,12 +409,10 @@ export function patchNativeUserMessagePrototype(
         if (!isEnabled()) return originalRender.call(this, safeWidth) as string[];
         const canCacheFinalOutput = typeof this === "object" && this !== null;
         const compact = isCompact?.() === true;
-        // Steers must stay bounded/hidden even when native Markdown rebuilding is
-        // bypassed for a huge paste or a tiny viewport.
+        // Keep long steers bounded even when native Markdown rebuilding is bypassed.
         if (compact && getSteerPresentation && canCacheFinalOutput) {
           const presentation = getSteerPresentation(this as object, safeWidth);
-          if (presentation?.hide === true) return [];
-          if (presentation?.lines) return presentation.lines;
+          if (presentation?.lines) return markPromptZone(presentation.lines);
         }
         if (safeWidth < MIN_BORDER_WIDTH) return originalRender.call(this, safeWidth) as string[];
         const markdownState = canCacheFinalOutput
@@ -480,14 +456,16 @@ export function patchNativeUserMessagePrototype(
             buildBottomBorder(safeWidth, theme),
           ];
 
+        // Restore navigation markers before caching so cache hits cannot lose or duplicate them.
+        const markedOutput = markPromptZone(output);
         if (canCacheFinalOutput) {
           finalOutputCache.set(
             this as object,
-            toFinalOutputCacheEntry(safeWidth, theme, markdownState, output, compact),
+            toFinalOutputCacheEntry(safeWidth, theme, markdownState, markedOutput, compact),
           );
         }
 
-        return output;
+        return markedOutput;
       },
   );
 }

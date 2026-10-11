@@ -65,12 +65,14 @@ Empty `/tools` opens the settings panel. Switching layout asks to reload this se
   › 先对照两边入口
   ● Bash — 把策略固化成 zone · 54 lines · 2.3KB           12s
 
+▎ Check the approach first
+▎ Keep the existing configuration
+
 ● Run (38 calls · 3 turns) · read ×12 · ask_user_question ×1 · edit ×8 · bash ×17
-  ↳ 2 steers
   took 2m14s · tok ↑62k ↓8.4k R120k W4.1k · at 2026-04-08 14:32:14
 ```
 
-While a turn is running, the latest assistant note stays under the header as Markdown, up to three lines. Each visible call keeps its elapsed time right-aligned on the first row and may use one bounded continuation row. After it settles, notes hide and a muted receipt shows duration, tokens, cache, and local time. Collapsed failures are `N failed` only. Mid-turn steers stay on the same Run ledger: first lines pin under the header while it runs, then one `↳ N steers` line remains. `Ctrl+O` expands the original timeline, with each `↳` in place, up to eight rows per call; failure details use an indented continuation row. The default `flat` timeline still shows one timed entry per call; set `toolCalls.expandedTimeline` to `turns` to group those entries under `↻ 1/3 · 3 calls` headers with indented calls. Long bash scripts show intent and size instead of the body. Agent and consult use the same compact call rows. Image reads stay in the Run ledger like other output. Switch back with `/tools individual`.
+While a turn is running, the latest assistant note stays under the header as Markdown, up to three lines. Each visible call keeps its elapsed time right-aligned on the first row and may use one bounded continuation row. After it settles, notes hide and a muted receipt shows duration, tokens, cache, and local time. Collapsed failures are `N failed` only. Mid-turn steers remain independent user messages at their original position, visible whether Run is collapsed or expanded. Tools on either side stay in separate Run blocks, each with its own counts and folding, so earlier calls never move below a later instruction. They still belong to the same request; summaries do not repeat steer text or counts. When a steer is inserted, completed-call previews in the preceding Run fold immediately, without waiting for the later Run to finish; calls still running remain visible until they finish. `Ctrl+O` expands the tool timeline, up to eight rows per call; failure details use an indented continuation row. The default `flat` timeline still shows one timed entry per call; set `toolCalls.expandedTimeline` to `turns` to group those entries under `↻ 1/3 · 3 calls` headers with indented calls. Long bash scripts show intent and size instead of the body. Agent and consult use the same compact call rows. Image reads stay in the Run ledger like other output. Switch back with `/tools individual`.
 
 User prompts always use the accent-gutter box.
 
@@ -102,7 +104,7 @@ For successful Edit calls with returned diff data, **Result is the diff**, witho
 
 In the ledger, `Bash(command)` is shown only when the complete target fits one display row. Longer or multiline commands show Bash, intent and size instead; click the expanded call to inspect the complete arguments.
 
-Expanded steers wrap at the terminal width. Up to eight content rows stay visible; longer messages keep the first three and last two rows around `… N lines hidden · click to view`. Click that omission row to inspect the original message. Collapsed steers still occupy one line each.
+Steer messages wrap at the terminal width. Up to eight content rows stay visible; longer messages keep the first three and last two rows around `… N lines hidden · click to view`. Click that omission row to inspect the original message. Run folding and `Ctrl+O` do not change this preview; Pi's previous/next-message shortcuts can still reach each steer.
 
 ### Context growth
 

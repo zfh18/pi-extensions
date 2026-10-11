@@ -20,7 +20,6 @@ import {
 	renderAggregateActivity,
 	renderAggregateMemberRow,
 	renderCollapsedAssistantNarration,
-	renderExpandedAggregateSteer,
 	restoreAggregateToolExecutions,
 } from "../src/aggregate-activity.ts";
 import { setAggregateCallPresentationLookup } from "../src/call-presentation-registry.ts";
@@ -555,16 +554,12 @@ test("a steered user message stays on the same Run ledger", () => {
 	const rendered = renderAggregateActivity(same!, 160, plainTheme());
 	assert.match(rendered[0] ?? "", /Run \(1 call · 1 turn\)/);
 	assert.doesNotMatch(rendered[0] ?? "", /steer/);
-	assert.match(rendered.join("\n"), /↳ 先确定方案/);
+	assert.doesNotMatch(rendered.join("\n"), /↳|先确定方案/);
 	assert.match(rendered.join("\n"), /› 合并已完成/);
-	assert.ok(
-		rendered.findIndex((line) => line.includes("↳"))
-			< rendered.findIndex((line) => line.includes("›")),
-	);
 	assert.doesNotMatch(rendered.join("\n"), /took /);
 });
 
-test("multiple steers pin first lines in arrival order", () => {
+test("multiple steers keep their order without entering the Run summary or frame", () => {
 	const projection = createProjection();
 	projection.startUserGroup("user-multi-steer");
 	projection.ingestAssistantMessage({
@@ -589,25 +584,19 @@ test("multiple steers pin first lines in arrival order", () => {
 	});
 	const view = projection.getView("edit-multi");
 	assert.equal(view?.steerCount, 2);
-	assert.deepEqual(view?.pinnedSteers.map((steer) => steer.firstLine), [
-		"先确定方案",
+	assert.deepEqual(projection.getGroups()[0]?.steers.map((steer) => steer.text), [
+		"先确定方案\n后面还有一段不应钉住",
 		"不要改 grok，用 xai",
 	]);
+	assert.equal(projection.getFramedItemIds("edit-multi").some((id) => id.startsWith("steer:")), false);
 	const rendered = renderAggregateActivity(view!, 80, plainTheme());
 	assert.match(rendered[0] ?? "", /Run \(1 call · 1 turn\)/);
 	assert.doesNotMatch(rendered[0] ?? "", /steer/);
-	const pinLines = rendered.filter((line) => line.includes("↳"));
-	assert.equal(pinLines.length, 2);
-	assert.match(pinLines[0] ?? "", /↳ 先确定方案/);
-	assert.doesNotMatch(pinLines[0] ?? "", /不应钉住/);
-	assert.match(pinLines[1] ?? "", /↳ 不要改 grok，用 xai/);
-	assert.ok(
-		rendered.findIndex((line) => line.includes("先确定方案"))
-			< rendered.findIndex((line) => line.includes("正在按新约束改 README")),
-	);
+	assert.doesNotMatch(rendered.join("\n"), /↳|先确定方案|不要改 grok/);
+	assert.match(rendered.join("\n"), /正在按新约束改 README/);
 });
 
-test("settling replaces first-line pins with one steer reminder", () => {
+test("settling keeps one Run total without a steer reminder", () => {
 	const startedAt = Date.parse("2026-04-08T14:30:00");
 	const endedAt = Date.parse("2026-04-08T14:32:14");
 	const projection = createProjection();
@@ -630,35 +619,17 @@ test("settling replaces first-line pins with one steer reminder", () => {
 		content: "不要改 grok，用 xai",
 		timestamp: startedAt + 3_000,
 	});
-	projection.markComplete("read-settle-steers", { content: [{ type: "text", text: "ok" }] }, false);
+	projection.markComplete("read-settle-steers", { content: [{ type: "text", text: "ok" }] }, false, { endedAtMs: endedAt });
 	projection.markGroupSettled("user-settle-steers", endedAt);
 	const view = projection.getView("read-settle-steers");
 	assert.equal(view?.settled, true);
 	assert.equal(view?.steerCount, 2);
-	assert.deepEqual(view?.pinnedSteers, []);
 	assert.equal(view?.durationMs, endedAt - startedAt);
 	const rendered = renderAggregateActivity(view!, 160, plainTheme());
 	assert.match(rendered[0] ?? "", /Run \(1 call · 1 turn\)/);
 	assert.doesNotMatch(rendered[0] ?? "", /steer/);
-	assert.equal(rendered[1], "  ↳ 2 steers");
-	assert.doesNotMatch(rendered.join("\n"), /先确定方案|不要改 grok/);
+	assert.doesNotMatch(rendered.join("\n"), /↳|steers|先确定方案|不要改 grok/);
 	assert.match(rendered.join("\n"), /took 2m14s/);
-	assert.ok(
-		rendered.findIndex((line) => line.includes("↳ 2 steers"))
-			< rendered.findIndex((line) => line.includes("took 2m14s")),
-	);
-});
-
-test("expanded steer rows highlight the first line and keep framed gaps", () => {
-	const rendered = renderExpandedAggregateSteer("先确定方案\n后面还有一段", 80, {
-		fg: (color, text) => color === "accent" ? `[accent]${text}` : text,
-	});
-	assert.equal(rendered.length, 4);
-	assert.match(rendered[0] ?? "", /│\s*$/);
-	assert.match(rendered[1] ?? "", /│.*\[accent\]↳ 先确定方案/);
-	assert.match(rendered[2] ?? "", /│.*后面还有一段/);
-	assert.doesNotMatch(rendered[2] ?? "", /\[accent\]/);
-	assert.match(rendered[3] ?? "", /[│└]\s*$/);
 });
 
 test("a follow-up after a final assistant starts a new Run group", () => {
@@ -712,16 +683,18 @@ test("rebuild treats a user after toolResult as a steer on the same group", () =
 		resultEntry("result-2", "edit-1", "edit"),
 	];
 	projection.rebuild(branch, messages(branch));
-	const view = projection.getView("edit-1");
+	const view = projection.getViewForGroup("edit-1");
+	assert.equal(projection.getView("read-1")?.callCount, 1);
+	assert.equal(projection.getView("edit-1")?.callCount, 1);
 	assert.equal(view?.callCount, 2);
 	assert.equal(view?.steerCount, 1);
 	assert.equal(view?.agentTurnCount, 2);
 	assert.equal(projection.getGroups().length, 1);
-	assert.equal(projection.getSteer("steer:user-1:0")?.firstLine, "先确定方案");
+	assert.equal(projection.getSteer("steer:user-1:0")?.text, "先确定方案");
 	const rebuilt = renderAggregateActivity(view!, 120, plainTheme());
 	assert.match(rebuilt[0] ?? "", /Run \(2 calls · 2 turns\)/);
 	assert.doesNotMatch(rebuilt[0] ?? "", /steer/);
-	assert.match(rebuilt.join("\n"), /↳ 1 steer/);
+	assert.doesNotMatch(rebuilt.join("\n"), /↳|steer|先确定方案/);
 });
 
 test("rebuild keeps a follow-up after a final assistant on a new group", () => {

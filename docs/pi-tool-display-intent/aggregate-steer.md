@@ -1,99 +1,63 @@
-# aggregate：steer 留在同一轮
+# aggregate：steer 独立显示，Run 按消息分段
 
-稳定决策。实现后只把 Why / 分组边界 / 展示契约留在 [`aggregate-layout.md`](./aggregate-layout.md)；本文件是本轮执行规格。
+## 分离请求统计与展示段
 
-## Goal
+Steer 是用户在执行过程中的转向，不是工具输出。每条 steer 留在原插入位置，作为独立用户消息显示；前后工具仍属于同一请求的统计 group。
 
-一次用户请求被中途改口时，画面仍是**同一本 Run 账本**。steer 是过程里的转向，不是新任务。
+同一统计 group 不等于一个跨越用户消息的折叠块。旧实现把累计 Run 摘要放在最后一个工具的位置：steer 后出现新工具，前段工具的摘要就移到了 steer 下面，造成调用归属错觉。现在每条 steer 都是展示边界，Run 的摘要、框线、旁白和局部开合不得越过它。
 
-不把多次 steer 拼进第一条 user 正文：那会抹掉改口时间点，也和 `/tree` 的每条 user 节点对不上。
+本契约替代“运行中钉 steer 首行、结束后显示 `N steers`、展开后将 steer 收进框线”，也替代“独立显示 steer，但整个请求仍只在最后一个工具处显示一个 Run”的行为。
 
-## 已拍板
+## 展示契约
 
-1. **同一轮**：steer 不断 group。follow-up 与闲时新提问仍新开一轮。
-2. **留在工具流中间**：展开后 `↳` 插在它发生的那一截，不挪到第一条 user 下面。
-3. **进行中钉顶**：收起且未 settle 时，steer 首行按时间顺序钉在 Run 头下，再下面才是旁白和当前活动。
-4. **结束后留一行**：settle 后不再钉各条首行，标题下留一行 `↳ N steers`。标题括号里不再重复计数。
-5. **中间那条原生 `▎` user 框必须藏掉**（收起时零高）。否则和钉顶重复，看起来像又开了一个任务。
-6. **不改 session**：不改写 user/assistant/tool 正文，不给消息加持久化 `steering` 字段。
+1. **独立用户消息**：steer 使用用户消息的强调色 `▎`，保留 Pi 在用户消息前的间距，不加 Run 的 `│` / `└` 框线。
+2. **按 steer 分段**：前段工具留在前段，后段工具只进入新段。收起、展开、完成、变宽和重建均不跨用户消息移动摘要。连续 steer 之间没有工具或可见通知时，不生成空 Run。
+3. **段内摘要**：每个 Run 只显示本段调用、turn、失败、通知、旁白、用量和耗时。请求级统计仍保留一个 group，不把全轮累计数伪装成后段计数。
+4. **段内开合**：点击 Run 仅切换该段；该段工具、旁白和通知共用状态。新段不继承前段的局部选择。`Ctrl+O` 仍控制全部段，但任何开合都不隐藏 steer，也不改变其预览。
+5. **不重复正文**：Run 不钉 steer 首行，不显示 `N steers` 提醒。用户消息不承载 Run 标题、开合或视口收起入口，也不把 steer 正文拼进第一条 user。
+6. **有界预览保留**：按终端显示行数换行，≤8 行内容完整显示，超出后保留头3尾2，中间提示省略数量。仅点击省略行打开原始消息的只读查看器，不切换 Run。
+7. **可导航**：独立用户消息仍带 OSC 133 边界，Pi 宿主配置的上一条／下一条消息快捷键可以定位它。
+8. **不改 session**：不改写 user/assistant/tool 正文，不给消息加持久化 `steering` 字段，不改变执行或请求分组规则。
 
-## 用户能看到的行为
-
-进行中：
+收起时两个 Run 的相对顺序：
 
 ```text
 ▎ 原始任务
 
-◐ Run (31 calls · 5 turns) · read ×18 · edit ×9
-  ↳ 先确定方案
-  ↳ 不要改 grok，用 xai
-  › 正在按新约束改 README
-  ◐ Edit(README.md)
+● Run (1 call · 1 turn) · read ×1
+
+▎ 先确定方案
+
+● Run (1 call · 1 turn) · edit ×1
 ```
 
-结束后：
+展开后，每段在自身标题下显示工具与旁白，框线在 steer 前闭合，在 steer 后重新开始。工具结果即使迟于 steer 到达，也更新声明该调用的原段，不搬到接收结果时的最新段；仍在执行的前段工具不会被伪造为完成或失败。
 
-```text
-✓ Run (31 calls · 5 turns) · read ×18 · edit ×9
-  ↳ 2 steers
-  took 2m14s · tok ↑62k ↓8.4k R120k W4.1k · at 14:32:14
-```
+Steer 实际插入消息流时（不是仅排入输入队列），前段的成功调用预览立即清除，不等待后段或整轮 `agent_settled`。前段仍有运行中调用时继续显示真实状态，晚到的成功结果直接归入该段摘要，不重新保留预览。后段仍使用正常的实时预览与结束延迟；清理预览不覆盖用户手动展开或 `Ctrl+O` 的选择。
 
-`Ctrl+O` 展开：
+## 分组与重建
 
-```text
-✓ Run (31 calls · 5 turns) · read ×18 · edit ×9
-  ↳ 2 steers
-  took 2m14s · …
-  │ › 先读 README
-  │ ✓ Read(README.md)
-  │
-  │ ↳ 先确定方案
-  │
-  │ › 按新约束改
-  │ ✓ Edit(README.md)
-  │
-  │ ↳ 不要改 grok，用 xai
-  │
-  └ ◐ Bash(pnpm test)
-```
-
-符号分开：原任务 `▎`，steer 用 accent 的 `↳`（展开时整条首行高亮），旁白继续 `›`。计数只出现在标题下那一行，不当错误。1 条写 `steer`，多条写 `steers`。展开后 `↳` 上下各空一行且空行带 `│`；Pi 插在 user 前的无边空白会被收掉，避免边线断开。
-
-钉住只取每条 steer 的**首行**（截到行宽），条数按时间全留，不做 `+N`。展开后按终端显示行数有界预览：≤8 行完整显示，超过后保留头3尾2，中间提示省略数量。点击省略行在只读窗口查看原始消息，不把整段粘贴日志倾倒到时间线。
-
-## 如何认出 steer
-
-落盘 user 消息没有 `steering` 字段，只有 `role / content / timestamp`。靠过程位置：
+落盘 user 消息没有 `steering` 字段，只有 `role / content / timestamp`。统计分组仍沿用过程位置：
 
 | 情况 | 判定 |
 |---|---|
-| 本 group 未 settle，且上一条可见消息是 `toolUse` / `toolResult` 之后的 user | **steer**，并入当前 group |
-| 连续多条这样的 user（`steeringMode=all` 一次倒空） | 都是 steer，同一 group |
-| live：`input.streamingBehavior === "steer"`，或 agent 仍在跑、下一条 user 满足上一行 | 同上 |
-| 上一条已是终态 assistant（无未完成 tool 批次），再来的 user | **新一轮**（follow-up 或闲时提问） |
-| custom message（`sendMessage` / 子 agent 完成通知） | 不是 user，不断 group，也不当 steer 钉顶 |
+| 本 group 未 settle，且 tool 批次之后出现 user | **steer**，统计并入当前 group，展示另起一段 |
+| 连续多条这样的 user（`steeringMode=all` 一次倒空） | 都是 steer，同一统计 group，各自独立显示 |
+| live：`input.streamingBehavior === "steer"` | 未 settle 的当前 group 内作为 steer |
+| 明确的 `followUp`，或终态 assistant 之后的新 user | 新一轮 |
+| custom message（`sendMessage` / 子 agent 完成通知） | 不是 user，不当 steer；可见通知归入当前位置的展示段 |
 
-不要在 steer 到达时把上一批 running 工具标成 failed。真实 steer 是等当前 tool 批次跑完再插入的。
+投影记录调用、assistant turn、旁白和通知所属的展示段。收起宿主、展开框线、计数、点击目标和视口身份使用同一分段口径；请求级统计不拆。流式 assistant ID 更新和晚到工具结果保留原段归属。段内展开状态按首个工具或通知的稳定身份保留；分支删除后旧视口句柄失效。
 
-reload / tree / compaction 用同一条位置规则从当前 branch 重建。接受：第一句 assistant 还没调用工具就改口时，reload 可能仍会拆开——宁可拆开，也不要把闲时新提问并进旧账。
-
-## 非目标
-
-- 不把 steer 文本写进上一条 user message。
-- 不给 session 加持久化标记。
-- 不改 tool 执行、call/result、模型上下文。
-- 不把 follow-up 当成 steer。
-- 不推断“分析中 / 实现中”。
+reload / tree / compaction 从当前 branch 按同一规则重建。第一句 assistant 还没调用工具就改口时，reload 可能仍会拆开——宁可拆开，也不要把闲时新提问并进旧账；这是既有分组限制，不在本次展示调整中扩大范围。
 
 ## 验收
 
-1. 工具批次之后插入 1 条或多条 steer：仍是一本 Run，call/turn 累计，不新开第二本。
-2. 进行中账本头下按时间钉住各条 steer **首行**，再下面是 `›` 旁白和当前活动。
-3. settle 后各条首行撤掉，标题下留一行 `↳ N steers`，标题括号里不再重复计数；耗时从原请求开始算到本轮结束。
-4. 收起时中间不再出现第二条 `▎` user 框。
-5. `Ctrl+O` 后 `↳` 出现在当时的工具/旁白之间，首行整行 accent，上下带 `│` 空行，和 `›` / `✓` 一眼能分。
-6. 闲时新提问、follow-up（终态回答之后的 user）仍新开 Run。
-7. reload / 切回 branch 后，toolResult 之后的 user 仍并入同一 group，计数和 `N steers` 正确。
-8. 不改写 Session 消息；切回 `individual` + `/reload` 仍能看到每条原始 user。
-9. 现有 aggregate 契约（旁白三行、failed 计数、passthrough、图片 fail-open、session 隔离）不回退。
+- live 和历史重建均保留单条、多条 steer 的原始顺序；收起和展开均为“前段 Run → steer → 后段 Run”。
+- 段内调用、turn、失败、通知、旁白和用量不串段；请求级调用总数不变。后段活动不延长已完成前段的耗时。
+- 已完成前段在 steer 插入时收起成功预览，不等后段结束；晚到的 execution-end、toolResult 和原生组件回填均不让旧预览回弹。后段预览、失败计数和手动开合不受影响。
+- 实际点击后段标题不会切换前段；`Ctrl+O`、完成和同 branch 重建均保持用户消息独立可见。
+- 连续 steer、不再调用工具、passthrough-only 段和空通知渲染器不产生错误宿主或空 Run；延迟结果不错误归入新段。
+- 长消息、窄窗口仍使用有界预览；省略行可查看原文且不改变 Run 状态。
+- 在真实工具组件组成的多段文档中，使用 Pi 宿主真实键位验证双向消息跳转；缓存命中及 Run 开合后仍能到达 steer。
+- 不改写 Session；`individual` 布局、工具执行、渲染缓存和会话隔离不回退。

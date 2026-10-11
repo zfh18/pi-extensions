@@ -11,7 +11,6 @@ import { formatAggregateArgumentPreview } from "./aggregate-argument-preview.js"
 import { agentReceiptChrome, formatAggregateAgentTarget, readAgentCallReceipt, type AgentCallReceipt } from "./aggregate-agent-call.js";
 import { ContextGrowthLedger, formatContextGrowth, type ContextGrowth } from "./context-growth.js";
 import { patchAggregateMouseHandling, recordAggregateClickRegions, recordAggregateNativeRegion, releaseAggregateClickRegions, restoreAggregateMouseHandling, type AggregateClickRegion } from "./aggregate-interaction.js";
-import { layoutSteerPreview } from "./steer-preview.js";
 import { patchAggregateGlobalExpansion, restoreAggregateGlobalExpansion } from "./aggregate-expansion.js";
 import { patchAggregateViewport, restoreAggregateViewport, resetAggregateViewportOwner, toggleAggregateViewportRun, type AggregateViewportRun } from "./aggregate-viewport.js";
 import { patchAggregateCustomMessages, restoreAggregateCustomMessages, bindExistingAggregateCustomMessages } from "./aggregate-custom-message.js";
@@ -94,7 +93,6 @@ export interface AggregateUsageTotals {
 export interface AggregateSteer {
 	id: string;
 	text: string;
-	firstLine: string;
 }
 
 export interface AggregateGroup {
@@ -110,6 +108,15 @@ export interface AggregateGroup {
 	steers: AggregateSteer[];
 	hasSeenToolBatch: boolean;
 	settled: boolean;
+	startedAtMs?: number;
+	endedAtMs?: number;
+}
+
+interface AggregateSegment {
+	id: string;
+	groupId: string;
+	closed: boolean;
+	expansionKey?: string;
 	startedAtMs?: number;
 	endedAtMs?: number;
 }
@@ -147,7 +154,6 @@ export interface AggregateActivityView {
 	failed: AggregateMember[];
 	failedCount: number;
 	steerCount: number;
-	pinnedSteers: Array<{ id: string; firstLine: string }>;
 	toolSummaries: AggregateToolSummary[];
 }
 
@@ -213,7 +219,6 @@ const ACTIVE_ROW_LIMIT = 3;
 const AGGREGATE_FRAME_CONTINUE = "  │ ";
 const AGGREGATE_FRAME_END = "  └ ";
 export const AGGREGATE_ASSISTANT_MARK = "›";
-export const AGGREGATE_STEER_MARK = "↳";
 const COLLAPSED_NARRATION_ROW_LIMIT = 3;
 const COLLAPSED_NARRATION_SOURCE_MAX_LENGTH = 2_000;
 const COLLAPSED_CALL_ROW_LIMIT = 2;
@@ -582,76 +587,6 @@ function renderNarrationMarkdownLines(text: string, width: number): string[] {
 	return wrapped.length > 0 ? wrapped : [text];
 }
 
-function colorSteerText(theme: AggregateRenderTheme, text: string): string {
-	try {
-		return theme.fg("accent", text);
-	} catch {
-		return text;
-	}
-}
-
-export function formatAggregateSteerCount(count: number): string {
-	return `${count} ${count === 1 ? "steer" : "steers"}`;
-}
-
-export function renderCollapsedSteerPins(
-	steers: ReadonlyArray<{ firstLine: string }>,
-	width: number,
-	theme: AggregateRenderTheme,
-): string[] {
-	const safeWidth = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
-	if (safeWidth === 0 || steers.length === 0) return [];
-	return steers.map((steer) =>
-		truncateToWidth(
-			`  ${colorSteerText(theme, `${AGGREGATE_STEER_MARK} ${steer.firstLine}`)}`,
-			safeWidth,
-			"…",
-		),
-	);
-}
-
-export function renderSettledSteerReminder(
-	steerCount: number,
-	width: number,
-	theme: AggregateRenderTheme,
-): string[] {
-	const safeWidth = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
-	if (safeWidth === 0 || steerCount <= 0) return [];
-	return [
-		truncateToWidth(
-			`  ${colorSteerText(theme, `${AGGREGATE_STEER_MARK} ${formatAggregateSteerCount(steerCount)}`)}`,
-			safeWidth,
-			"…",
-		),
-	];
-}
-
-export function renderExpandedAggregateSteer(
-	text: string,
-	width: number,
-	theme: AggregateRenderTheme,
-	edge: AggregateFrameEdge = "only",
-): string[] {
-	return renderExpandedAggregateSteerLayout(text, width, theme, edge).lines;
-}
-
-export function renderExpandedAggregateSteerLayout(
-	text: string,
-	width: number,
-	theme: AggregateRenderTheme,
-	edge: AggregateFrameEdge = "only",
-): { lines: string[]; omissionRow?: number } {
-	const bodyWidth = Math.max(0, width - visibleWidth(framePrefixForEdge(edge)) - 2);
-	const preview = layoutSteerPreview(text, bodyWidth);
-	if (preview.rows.length === 0) return { lines: [] };
-	const marked = ["", ...preview.rows.map((line, index) => index === 0
-		? colorSteerText(theme, `${AGGREGATE_STEER_MARK} ${line}`) : `  ${line}`), ""];
-	return {
-		lines: applyAggregateGroupFrame(marked, width, theme, edge),
-		omissionRow: preview.omissionRow === undefined ? undefined : preview.omissionRow + 1,
-	};
-}
-
 export function renderCollapsedAssistantNarration(
 	text: string,
 	width: number,
@@ -751,20 +686,6 @@ export function userMessageText(message: unknown): string {
 		.filter((entry) => toRecord(entry).type === "text")
 		.map((entry) => String(toRecord(entry).text ?? ""))
 		.join("");
-}
-
-export function steerFirstLine(text: string): string {
-	const sanitized = text
-		.replace(OSC_SEQUENCE_PATTERN, "")
-		.replace(ANSI_SEQUENCE_PATTERN, "")
-		.replace(NARRATION_CONTROL_PATTERN, "")
-		.replace(/\r\n/g, "\n")
-		.replace(/\r/g, "\n");
-	for (const line of sanitized.split("\n")) {
-		const trimmed = line.trim();
-		if (trimmed) return trimmed;
-	}
-	return "";
 }
 
 function minDefined(values: Array<number | undefined>): number | undefined {
@@ -931,6 +852,9 @@ export class AggregateProjection {
 	private readonly groups: AggregateGroup[] = [];
 	private readonly groupsById = new Map<string, AggregateGroup>();
 	private readonly membersById = new Map<string, AggregateMember>();
+	private readonly segmentsById = new Map<string, AggregateSegment>();
+	private readonly segmentsByGroup = new Map<string, AggregateSegment[]>();
+	private readonly segmentByItem = new Map<string, AggregateSegment>();
 	private readonly framedGroupById = new Map<string, string>();
 	private readonly visibleFrameContent = new Set<string>();
 	private readonly frameInvalidators = new Map<string, () => void>();
@@ -992,6 +916,7 @@ export class AggregateProjection {
 		this.bindCustomMessage(message, id);
 		if (!group.customItemIds.includes(id)) group.customItemIds.push(id);
 		if (!group.members.length) group.expansionKey ??= id;
+		this.currentSegment(group).expansionKey ??= id;
 		this.trackFramedItem(id, group.groupId);
 		if (!group.members.length && !group.agentTurnIds.length) group.settled = true;
 		this.initialized = true;
@@ -1041,8 +966,56 @@ export class AggregateProjection {
 		this.clearViewportState();
 	}
 
-	private collapsedHost(group: AggregateGroup): string | undefined {
+	private createSegment(group: AggregateGroup, timestampMs?: number): AggregateSegment {
+		const segments = this.segmentsByGroup.get(group.groupId) ?? [];
+		const segment = { id: segments.length ? `${group.groupId}:segment:${segments.length}` : group.groupId,
+			groupId: group.groupId, closed: false, startedAtMs: timestampMs, endedAtMs: timestampMs };
+		segments.push(segment);
+		this.segmentsByGroup.set(group.groupId, segments);
+		this.segmentsById.set(segment.id, segment);
+		return segment;
+	}
+
+	private currentSegment(group: AggregateGroup): AggregateSegment {
+		return this.segmentsByGroup.get(group.groupId)?.at(-1) ?? this.createSegment(group);
+	}
+
+	private segmentForItem(itemId: string): AggregateSegment | undefined {
+		return this.segmentByItem.get(itemId) ?? this.segmentsById.get(itemId);
+	}
+
+	// Statistics retain one request group; renderers only see the slice between user messages.
+	private displayGroupForItem(itemId: string): AggregateGroup | undefined {
+		const segment = this.segmentForItem(itemId);
+		const group = segment ? this.groupsById.get(segment.groupId) : this.groupForItem(itemId);
+		if (!group || !segment || !group.steers.length) return group;
+		const belongs = (id: string) => this.segmentByItem.get(id) === segment;
+		const members = group.members.filter((member) => belongs(member.toolCallId));
+		const running = members.some((member) => member.state === "pending" || member.state === "running");
+		const startedAtMs = minDefined([segment.startedAtMs, ...members.map((member) => member.startedAtMs)]);
+		const endedAtMs = maxDefined([segment.endedAtMs, ...members.map((member) => member.endedAtMs)]);
+		return { ...group, members,
+			framedItemIds: group.framedItemIds.filter(belongs),
+			customItemIds: group.customItemIds.filter(belongs),
+			agentTurnIds: group.agentTurnIds.filter(belongs),
+			usageByKey: new Map([...group.usageByKey].filter(([key]) => belongs(key))),
+			leaderToolCallId: members.findLast((member) => member.visible && member.state !== "needsAttention" && !this.isPassthrough(member.toolName))?.toolCallId,
+			expansionKey: segment.expansionKey ?? segment.id,
+			settled: (segment.closed || group.settled) && !running,
+			startedAtMs, endedAtMs,
+		};
+	}
+
+	private invalidateSegmentHosts(group: AggregateGroup): void {
+		for (const segment of this.segmentsByGroup.get(group.groupId) ?? []) {
+			const display = this.displayGroupForItem(segment.id);
+			if (display) this.invalidateIds(this.collapsedHost(display));
+		}
+	}
+
+	private collapsedHost(group: AggregateGroup, segment?: AggregateSegment): string | undefined {
 		return group.framedItemIds.findLast((id) => {
+			if (segment && this.segmentByItem.get(id) !== segment) return false;
 			if (this.customMessages.has(id)) return !this.emptyCustomFrames.has(id);
 			const member = this.membersById.get(id);
 			return member?.visible && member.state !== "needsAttention" && !this.isPassthrough(member.toolName);
@@ -1082,8 +1055,11 @@ export class AggregateProjection {
 	}
 
 	isItemExpanded(itemId: string, fallback = false): boolean {
-		const group = this.groupForItem(itemId);
-		return (group && this.expandedGroups.get(group.expansionKey ?? group.members[0]?.toolCallId ?? group.groupId))
+		const segment = this.segmentForItem(itemId);
+		const group = segment ? this.groupsById.get(segment.groupId) : this.groupForItem(itemId);
+		const key = segment ? (segment.expansionKey ?? segment.id)
+			: group?.expansionKey ?? group?.members[0]?.toolCallId ?? group?.groupId;
+		return (key ? this.expandedGroups.get(key) : undefined)
 			?? (this.timelineExpansionObserved ? this.timelineExpanded : fallback);
 	}
 
@@ -1092,19 +1068,20 @@ export class AggregateProjection {
 	}
 
 	getViewportRun(itemId: string): AggregateViewportRun | undefined {
-		const group = this.groupForItem(itemId);
-		if (!group) return undefined;
-		const cached = this.viewportRuns.get(group.groupId);
+		const segment = this.segmentForItem(itemId);
+		if (!segment) return undefined;
+		const id = segment.id;
+		const cached = this.viewportRuns.get(id);
 		if (cached) return cached;
-		const id = group.groupId;
 		const run: AggregateViewportRun = {
 			owner: this, id,
-			isValid: () => this.viewportRuns.get(id) === run && this.groupsById.has(id),
+			isValid: () => this.viewportRuns.get(id) === run && this.segmentsById.has(id),
 			isExpanded: () => this.isItemExpanded(id),
 			toggle: () => { if (run.isValid()) this.toggleGroupExpansion(id); },
 			label: () => {
-				const count = this.groupsById.get(id)?.members.filter((member) => member.visible).length ?? 0;
-				const messages = this.groupsById.get(id)?.customItemIds.filter((item) => !this.emptyCustomFrames.has(item)).length ?? 0;
+				const group = this.displayGroupForItem(id);
+				const count = group?.members.filter((member) => member.visible).length ?? 0;
+				const messages = group?.customItemIds.filter((item) => !this.emptyCustomFrames.has(item)).length ?? 0;
 				const parts = count > 0 || messages === 0 ? [`${count} ${pluralize(count, "call")}`] : [];
 				if (messages) parts.push(`${messages} ${pluralize(messages, "message")}`);
 				return `Run (${parts.join(" · ")})`;
@@ -1125,7 +1102,7 @@ export class AggregateProjection {
 	}
 
 	toggleGroupExpansion(itemId: string): void {
-		const group = this.groupForItem(itemId);
+		const group = this.displayGroupForItem(itemId);
 		if (!group) return;
 		const expanded = !this.isItemExpanded(itemId);
 		this.timelineExpansionObserved = true;
@@ -1150,27 +1127,18 @@ export class AggregateProjection {
 	}
 
 	hasPaintedToolsLedger(message?: unknown): boolean {
-		const turnId = aggregateAssistantTurnId(message);
-		if (turnId) {
-			for (const group of this.groups) {
-				if (group.agentTurnIds.includes(turnId)) return Boolean(group.leaderToolCallId);
-			}
-			return false;
-		}
+		const turnId = this.contextTurnId(message);
+		if (turnId) return Boolean(this.displayGroupForItem(turnId)?.leaderToolCallId);
 		const active = this.activeGroupId ? this.groupsById.get(this.activeGroupId) : undefined;
-		return Boolean(active?.leaderToolCallId);
+		return Boolean(active && this.displayGroupForItem(this.currentSegment(active).id)?.leaderToolCallId);
 	}
 
 	assistantFollowsAggregateLedger(message?: unknown): boolean {
-		const turnId = aggregateAssistantTurnId(message);
-		if (!turnId) return false;
-		for (const group of this.groups) {
-			if (!group.agentTurnIds.includes(turnId) || !group.leaderToolCallId) continue;
-			const firstToolTurn = this.toolTurnIds(group)[0];
-			if (!firstToolTurn) return false;
-			return group.agentTurnIds.indexOf(turnId) > group.agentTurnIds.indexOf(firstToolTurn);
-		}
-		return false;
+		const turnId = this.contextTurnId(message);
+		const group = turnId ? this.displayGroupForItem(turnId) : undefined;
+		if (!turnId || !group?.leaderToolCallId) return false;
+		const firstToolTurn = this.toolTurnIds(group)[0];
+		return Boolean(firstToolTurn && group.agentTurnIds.indexOf(turnId) > group.agentTurnIds.indexOf(firstToolTurn));
 	}
 
 	framedItemFollowsTool(itemId: string): boolean {
@@ -1242,7 +1210,7 @@ export class AggregateProjection {
 		edge: AggregateFrameEdge,
 		nowMs: number,
 	): ExpandedTurnPresentation {
-		const group = this.groupsById.get(member.groupId);
+		const group = this.displayGroupForItem(member.toolCallId);
 		if (!group || !member.agentTurnId) return { indent: false };
 		const turnIds = this.toolTurnIds(group, this.showContextGrowth());
 		const index = turnIds.indexOf(member.agentTurnId);
@@ -1284,8 +1252,7 @@ export class AggregateProjection {
 	}
 
 	getFramedItemIds(itemId: string): string[] {
-		const groupId = this.framedGroupById.get(itemId);
-		return groupId ? (this.groupsById.get(groupId)?.framedItemIds ?? []).filter((id) => !this.emptyCustomFrames.has(id)) : [];
+		return (this.displayGroupForItem(itemId)?.framedItemIds ?? []).filter((id) => !this.emptyCustomFrames.has(id));
 	}
 
 	isFrameStart(itemId: string): boolean {
@@ -1302,8 +1269,7 @@ export class AggregateProjection {
 	hasVisibleFrameContent(itemId: string): boolean {
 		if (
 			!itemId.startsWith("assistant-before:") &&
-			!itemId.startsWith("assistant:") &&
-			!itemId.startsWith("steer:")
+			!itemId.startsWith("assistant:")
 		) {
 			return true;
 		}
@@ -1327,6 +1293,12 @@ export class AggregateProjection {
 		else this.visibleFrameContent.delete(itemId);
 		const nextHost = this.getFramedItemIds(itemId).find((id) => this.hasVisibleFrameContent(id));
 		if (previousHost !== nextHost) this.invalidateIds(previousHost, nextHost, itemId);
+	}
+
+	getSegmentView(itemId: string): AggregateActivityView | undefined {
+		const group = this.displayGroupForItem(itemId);
+		const host = group && this.collapsedHost(group);
+		return group && host ? this.buildGroupView(group, host) : undefined;
 	}
 
 	getViewForGroup(itemId: string): AggregateActivityView | undefined {
@@ -1357,6 +1329,10 @@ export class AggregateProjection {
 		if (existingGroupId === resolvedGroupId) return;
 		if (existingGroupId) this.untrackFramedItem(itemId);
 		const group = this.ensureGroup(resolvedGroupId);
+		if (!this.segmentByItem.has(itemId)) {
+			const hint = beforeId ?? (itemId.startsWith("assistant-before:") ? itemId.slice("assistant-before:".length) : "");
+			this.segmentByItem.set(itemId, this.segmentForItem(hint) ?? this.currentSegment(group));
+		}
 		const previousLast = group.framedItemIds[group.framedItemIds.length - 1];
 		const beforeIndex = beforeId ? group.framedItemIds.indexOf(beforeId) : -1;
 		if (beforeIndex >= 0) group.framedItemIds.splice(beforeIndex, 0, itemId);
@@ -1385,7 +1361,7 @@ export class AggregateProjection {
 		if (!resolvedGroupId || !itemId || !text) return;
 		const group = this.ensureGroup(resolvedGroupId);
 		group.narrationById.set(itemId, text);
-		this.invalidateIds(group.leaderToolCallId);
+		this.invalidateGroup(group.groupId, itemId);
 	}
 
 	rememberAgentTurn(message: unknown): void {
@@ -1393,9 +1369,11 @@ export class AggregateProjection {
 		const previousId = message && typeof message === "object"
 			? this.turnIdsByMessage.get(message) ?? this.membersById.get(toolCallsFromMessage(message)[0]?.id ?? "")?.agentTurnId
 			: undefined;
-		const id = aggregateAssistantTurnId(message) ?? previousId ?? `assistant-turn:${group.agentTurnIds.length + 1}`;
+		const id = aggregateAssistantTurnId(message) ?? previousId ?? `assistant-turn:${group.groupId}:${group.agentTurnIds.length + 1}`;
 		// A later message_end handler may replace timestamp/id in place. Reconcile
 		// the streaming turn instead of creating a phantom turn at turn_end.
+		const segment = this.segmentForItem(previousId ?? id) ?? this.currentSegment(group);
+		this.segmentByItem.set(id, segment);
 		if (previousId && previousId !== id && group.agentTurnIds.includes(previousId)) {
 			group.agentTurnIds = [...new Set(group.agentTurnIds.map((value) => value === previousId ? id : value))];
 			group.usageByKey.delete(previousId);
@@ -1412,30 +1390,36 @@ export class AggregateProjection {
 		if (!group.agentTurnIds.includes(id)) group.agentTurnIds.push(id);
 		if (message && typeof message === "object") this.turnIdsByMessage.set(message, id);
 		this.rememberUsage(id, message);
-		this.rememberEndedAt(messageTimestampMs(message));
+		this.rememberEndedAt(messageTimestampMs(message), id);
 	}
 
 	rememberUsage(key: string, value: unknown): void {
 		const usage = usageFromUnknown(value);
 		if (!key || !usage) return;
-		const group = this.ensureActiveGroup();
+		const itemId = key.startsWith("tool:") ? key.slice(5) : key;
+		const group = this.groupForItem(itemId) ?? this.ensureActiveGroup();
+		this.segmentByItem.set(key, this.segmentForItem(itemId) ?? this.currentSegment(group));
 		group.usageByKey.set(key, usage);
-		this.invalidateIds(group.leaderToolCallId);
+		this.invalidateGroup(group.groupId);
 	}
 
-	rememberStartedAt(timestampMs: number | undefined): void {
+	rememberStartedAt(timestampMs: number | undefined, itemId?: string): void {
 		if (timestampMs === undefined) return;
-		const group = this.ensureActiveGroup();
+		const group = (itemId ? this.groupForItem(itemId) : undefined) ?? this.ensureActiveGroup();
 		if (group.startedAtMs === undefined || timestampMs < group.startedAtMs) group.startedAtMs = timestampMs;
-		this.invalidateIds(group.leaderToolCallId);
+		const segment = (itemId ? this.segmentForItem(itemId) : undefined) ?? this.currentSegment(group);
+		segment.startedAtMs = minDefined([segment.startedAtMs, timestampMs]);
+		this.invalidateSegmentHosts(group);
 	}
 
-	rememberEndedAt(timestampMs: number | undefined): void {
+	rememberEndedAt(timestampMs: number | undefined, itemId?: string): void {
 		if (timestampMs === undefined) return;
-		this.rememberStartedAt(timestampMs);
-		const group = this.ensureActiveGroup();
+		this.rememberStartedAt(timestampMs, itemId);
+		const group = (itemId ? this.groupForItem(itemId) : undefined) ?? this.ensureActiveGroup();
 		if (group.endedAtMs === undefined || timestampMs > group.endedAtMs) group.endedAtMs = timestampMs;
-		this.invalidateIds(group.leaderToolCallId);
+		const segment = (itemId ? this.segmentForItem(itemId) : undefined) ?? this.currentSegment(group);
+		segment.endedAtMs = maxDefined([segment.endedAtMs, timestampMs]);
+		this.invalidateSegmentHosts(group);
 	}
 
 	markGroupSettled(groupId = this.activeGroupId, endedAtMs?: number): void {
@@ -1444,7 +1428,7 @@ export class AggregateProjection {
 		if (!group || group.settled) return;
 		group.settled = true;
 		this.rememberEndedAt(endedAtMs ?? (group.endedAtMs === undefined ? Date.now() : undefined));
-		this.invalidateIds(group.leaderToolCallId);
+		this.invalidateSegmentHosts(group);
 		this.syncRunPulse();
 	}
 
@@ -1453,7 +1437,7 @@ export class AggregateProjection {
 		if (live && !this.pulseTimer) {
 			this.pulseTimer = setInterval(() => {
 				for (const group of this.groups) {
-					if (!group.settled) this.invalidateIds(group.leaderToolCallId);
+					if (!group.settled) this.invalidateSegmentHosts(group);
 				}
 				if (!this.groups.some((group) => !group.settled)) this.stopRunPulse();
 			}, RUN_BREATHE_TICK_MS);
@@ -1471,9 +1455,7 @@ export class AggregateProjection {
 	}
 
 	latestNarrationFor(itemId: string): string | undefined {
-		const groupId = this.framedGroupById.get(itemId) ?? this.membersById.get(itemId)?.groupId;
-		if (!groupId) return undefined;
-		const group = this.groupsById.get(groupId);
+		const group = this.displayGroupForItem(itemId);
 		if (!group) return undefined;
 		for (let index = group.framedItemIds.length - 1; index >= 0; index--) {
 			const narration = group.narrationById.get(group.framedItemIds[index]!);
@@ -1519,14 +1501,13 @@ export class AggregateProjection {
 		const group = this.activeGroupId ? this.groupsById.get(this.activeGroupId) : undefined;
 		if (!group) return undefined;
 		const id = `steer:${group.groupId}:${group.steers.length}`;
-		group.steers.push({
-			id,
-			text,
-			firstLine: steerFirstLine(text),
-		});
-		this.trackFramedItem(id, group.groupId);
+		group.steers.push({ id, text });
 		this.rememberEndedAt(timestampMs);
-		this.invalidateIds(group.leaderToolCallId);
+		const segment = this.currentSegment(group);
+		segment.closed = true;
+		this.collapseRetainedDone(segment.id);
+		this.createSegment(group, timestampMs);
+		this.invalidateGroup(group.groupId);
 		return id;
 	}
 
@@ -1625,13 +1606,14 @@ export class AggregateProjection {
 				// arrives during its text stream. Later tool-call discovery must not
 				// put the Run title below that earlier narration.
 				const turn = this.contextTurnId(message);
+				this.segmentByItem.set(frameId, this.segmentForItem(turn ?? "") ?? this.currentSegment(this.ensureActiveGroup()));
 				const beforeNotice = this.ensureActiveGroup().customItemIds.find((id) => this.customAfterTurn.get(id) === turn);
 				this.trackFramedItem(frameId, this.activeGroupId, beforeNotice ?? calls[0]?.id);
 				this.rememberNarration(frameId, narration);
 			}
 		}
 		for (const call of calls) {
-			this.addOrUpdateMember(call.id, call.name, call.args, true);
+			this.addOrUpdateMember(call.id, call.name, call.args, true, this.contextTurnId(message));
 		}
 		if (isAssistantTerminalFailure(message)) {
 			const summary = assistantFailureSummary(message);
@@ -1664,7 +1646,7 @@ export class AggregateProjection {
 			});
 		}
 		this.markGroupSawToolBatch(this.membersById.get(String(record.toolCallId))?.groupId);
-		this.rememberEndedAt(messageTimestampMs(message, options.fallbackTimestamp));
+		this.rememberEndedAt(messageTimestampMs(message, options.fallbackTimestamp), String(record.toolCallId));
 	}
 
 	markStarted(toolCallId: string, toolName: string, args: unknown): void {
@@ -1715,10 +1697,11 @@ export class AggregateProjection {
 		member.state = "success";
 		member.errorSummary = undefined;
 		this.stampMemberEnd(member, options);
-		if (firstSuccess && options.retainDone !== false && !this.isPassthrough(member.toolName)) {
+		if (firstSuccess && options.retainDone !== false && !this.isPassthrough(member.toolName)
+			&& !this.segmentForItem(toolCallId)?.closed) {
 			member.retainedDone = true;
 			member.completionOrder = ++this.completionOrder;
-			this.trimRetainedDone(member.groupId);
+			this.trimRetainedDone(toolCallId);
 		}
 		this.invalidateGroup(member.groupId, toolCallId);
 	}
@@ -1762,9 +1745,10 @@ export class AggregateProjection {
 		member.endedAtMs = Date.now();
 	}
 
-	collapseRetainedDone(): void {
+	collapseRetainedDone(itemId?: string): void {
+		const members = itemId === undefined ? this.membersById.values() : this.displayGroupForItem(itemId)?.members ?? [];
 		const changedGroups = new Set<string>();
-		for (const member of this.membersById.values()) {
+		for (const member of members) {
 			if (!member.retainedDone) continue;
 			member.retainedDone = false;
 			member.completionOrder = undefined;
@@ -1801,6 +1785,9 @@ export class AggregateProjection {
 		this.groups.length = 0;
 		this.groupsById.clear();
 		this.membersById.clear();
+		this.segmentsById.clear();
+		this.segmentsByGroup.clear();
+		this.segmentByItem.clear();
 		this.framedGroupById.clear();
 		this.visibleFrameContent.clear();
 		this.frameInvalidators.clear();
@@ -1830,7 +1817,7 @@ export class AggregateProjection {
 			if (role === "assistant") {
 				this.ingestAssistantMessage(message);
 				const startedAtMs = messageTimestampMs(message, toRecord(entry).timestamp);
-				this.rememberEndedAt(startedAtMs);
+				this.rememberEndedAt(startedAtMs, this.contextTurnId(message));
 				for (const call of toolCallsFromMessage(message)) {
 					const member = this.membersById.get(call.id);
 					if (!member) continue;
@@ -1870,7 +1857,10 @@ export class AggregateProjection {
 				// A removed row may already belong to a disposed transcript.
 			}
 		}
-		const expansionKeys = new Set(this.groups.map((group) => group.expansionKey ?? group.members[0]?.toolCallId ?? group.groupId));
+		const expansionKeys = new Set([...this.segmentsById.values()].map((segment) => {
+			const group = this.displayGroupForItem(segment.id)!;
+			return group.expansionKey ?? group.members[0]?.toolCallId ?? group.groupId;
+		}));
 		for (const key of this.expandedGroups.keys()) {
 			if (!expansionKeys.has(key)) this.expandedGroups.delete(key);
 		}
@@ -1924,11 +1914,7 @@ export class AggregateProjection {
 				...group.agentTurnIds.map((id) => formatContextGrowth(this.contextGrowth.getTurn(id)))].join("|");
 			next.set(group.groupId, display);
 			if (fullInvalidation || !this.showContextGrowth() || this.contextGrowthDisplays.get(group.groupId) === display) continue;
-			if (this.isItemExpanded(group.groupId)) {
-				this.invalidateIds(...group.members.map((member) => member.toolCallId), ...group.customItemIds);
-			} else {
-				this.invalidateIds(this.collapsedHost(group));
-			}
+			this.invalidateIds(...group.members.map((member) => member.toolCallId), ...group.customItemIds);
 			for (const id of group.agentTurnIds) {
 				try { this.contextInvalidators.get(id)?.(); } catch { /* Disposed transcript component. */ }
 			}
@@ -1961,7 +1947,7 @@ export class AggregateProjection {
 		// Their finalized usage still participates in the run's measurements.
 		if (!this.showContextGrowth() || toolCallsFromMessage(message).length === 0) return [];
 		const id = this.contextTurnId(message);
-		const group = id ? this.groups.find((entry) => entry.agentTurnIds.includes(id)) : undefined;
+		const group = id ? this.displayGroupForItem(id) : undefined;
 		if (!id || !group) return [];
 		const lines: string[] = [];
 		const growth = this.contextGrowth.getTurn(id);
@@ -1989,8 +1975,9 @@ export class AggregateProjection {
 
 	getView(itemId: string): AggregateActivityView | undefined {
 		const group = this.groupForItem(itemId);
-		if (!group || this.collapsedHost(group) !== itemId) return undefined;
-		return this.buildGroupView(group, itemId);
+		// Hidden tool rows need no filtered ledger or usage map on each repaint.
+		if (!group || this.collapsedHost(group, this.segmentForItem(itemId)) !== itemId) return undefined;
+		return this.buildGroupView(this.displayGroupForItem(itemId)!, itemId);
 	}
 
 	private buildGroupView(group: AggregateGroup, hostId: string): AggregateActivityView {
@@ -2048,9 +2035,6 @@ export class AggregateProjection {
 			failed,
 			failedCount: grouped.filter((entry) => entry.state === "failed").length,
 			steerCount: group.steers.length,
-			pinnedSteers: group.settled
-				? []
-				: group.steers.map((steer) => ({ id: steer.id, firstLine: steer.firstLine })),
 			toolSummaries: [...summaries.values()],
 		};
 	}
@@ -2089,6 +2073,7 @@ export class AggregateProjection {
 			};
 			this.groups.push(group);
 			this.groupsById.set(groupId, group);
+			this.createSegment(group);
 		}
 		return group;
 	}
@@ -2103,6 +2088,7 @@ export class AggregateProjection {
 		toolName: string,
 		args: unknown,
 		visible: boolean,
+		agentTurnId?: string,
 	): AggregateMember {
 		const existing = this.membersById.get(toolCallId);
 		if (existing) {
@@ -2118,7 +2104,11 @@ export class AggregateProjection {
 
 		const group = this.ensureActiveGroup();
 		group.hasSeenToolBatch = true;
-		this.evictOldestRetainedDone(group);
+		const turnId = agentTurnId ?? group.agentTurnIds.at(-1);
+		const segment = (agentTurnId ? this.segmentForItem(agentTurnId) : undefined) ?? this.currentSegment(group);
+		this.segmentByItem.set(toolCallId, segment);
+		segment.expansionKey ??= toolCallId;
+		this.evictOldestRetainedDone(this.displayGroupForItem(toolCallId) ?? group);
 		const previousLeader = group.leaderToolCallId;
 		const member: AggregateMember = {
 			toolCallId,
@@ -2128,7 +2118,7 @@ export class AggregateProjection {
 			args: { ...toRecord(args) },
 			state: "pending",
 			visible,
-			agentTurnId: group.agentTurnIds.at(-1),
+			agentTurnId: turnId,
 		};
 		group.members.push(member);
 		this.membersById.set(toolCallId, member);
@@ -2152,8 +2142,8 @@ export class AggregateProjection {
 		oldest.completionOrder = undefined;
 	}
 
-	private trimRetainedDone(groupId: string): void {
-		const group = this.groupsById.get(groupId);
+	private trimRetainedDone(itemId: string): void {
+		const group = this.displayGroupForItem(itemId);
 		if (!group) return;
 		while (group.members.filter((member) => member.retainedDone).length > ACTIVE_ROW_LIMIT) {
 			this.evictOldestRetainedDone(group);
@@ -2176,7 +2166,8 @@ export class AggregateProjection {
 
 	private invalidateGroup(groupId: string, changedId?: string): void {
 		const group = this.groupsById.get(groupId);
-		this.invalidateIds(group?.leaderToolCallId, group && this.collapsedHost(group), changedId);
+		if (group) this.invalidateSegmentHosts(group);
+		this.invalidateIds(group?.leaderToolCallId, changedId);
 	}
 
 	private invalidateIds(...ids: Array<string | undefined>): void {
@@ -2407,11 +2398,6 @@ export function renderAggregateActivity(
 	}
 
 	const lines = [truncateToWidth(header, safeWidth, "…")];
-	if (view.settled) {
-		lines.push(...renderSettledSteerReminder(view.steerCount ?? 0, safeWidth, theme));
-	} else {
-		lines.push(...renderCollapsedSteerPins(view.pinnedSteers ?? [], safeWidth, theme));
-	}
 	const stats = formatAggregateStatsLine(view);
 	if (stats) {
 		lines.push(truncateToWidth(`  ${theme.fg("muted", stats)}`, safeWidth, "…"));
@@ -2436,8 +2422,8 @@ export function renderAggregateActivity(
 }
 
 export function renderExpandedAggregateSummary(view: AggregateActivityView, width: number, theme: AggregateRenderTheme): string[] {
-	// Expanded rows already contain these notes, steers and calls in source order.
-	return renderAggregateActivity({ ...view, latestNarration: undefined, displayRows: [], activeOverflow: 0, pinnedSteers: [] }, width, theme);
+	// Expanded rows already contain these notes and calls in source order.
+	return renderAggregateActivity({ ...view, latestNarration: undefined, displayRows: [], activeOverflow: 0 }, width, theme);
 }
 
 function getToolExecutionPrototype(): PatchableToolExecutionPrototype {
@@ -2592,7 +2578,7 @@ export function patchAggregateToolExecutions(projection: AggregateProjection): v
 			let lines = detail.lines;
 			let offset = 0;
 			if (activeProjection.shouldHostExpandedSummary(toolCallId)) {
-				const headerView = activeProjection.getViewForGroup(toolCallId);
+				const headerView = activeProjection.getSegmentView(toolCallId);
 				if (headerView) {
 					const header = renderExpandedAggregateSummary(headerView, width, activeProjection.getRenderTheme());
 					lines = attachExpandedAggregateSummary(header, detail.lines);
