@@ -18,6 +18,7 @@ import { createAggregateCollapseWidget } from "./aggregate-collapse-widget.js";
 import type { DetailRequest } from "./detail-viewer.js";
 import { lookupAggregateCallPresentation } from "./call-presentation-registry.js";
 import { getDisplaySummary, normalizeDisplaySummary, stripDisplaySummary } from "./display-summary.js";
+import { appendThinkingBlock, hasThinkingText, renderAggregateThinkingBlock, thinkingSize, type AggregateThinkingBlock, type AggregateThinkingPart, type AggregateThinkingStatus } from "./aggregate-thinking-block.js";
 import type { ExpandedTimeline, ToolDisplayConfig } from "./types.js";
 import { layoutPreviewRows } from "./preview-text.js";
 import { pluralize, shortenPath } from "./render-utils.js";
@@ -878,6 +879,17 @@ export class AggregateProjection {
 	private readonly viewportRuns = new Map<string, AggregateViewportRun>();
 	private detailOpener?: (request: DetailRequest) => Promise<void>;
 	private detailOpen = false;
+	// Segment Thinking: [Run] → Thinking → answer. Session messages are never rewritten.
+	private readonly thinkingByTurn = new Map<string, unknown>();
+	private readonly thinkingParts = new Map<string, AggregateThinkingPart>();
+	private readonly expandedThinking = new Set<string>();
+	private readonly interruptedThinking = new Set<string>();
+	private readonly thinkingHosts = new Map<string, string>();
+	private readonly thinkingSignatures = new Map<string, string>();
+	private readonly thinkingRuns = new Map<string, AggregateViewportRun>();
+	private readonly thinkingViewportOwner = {};
+	private activeThinkingTurn: string | undefined;
+	private thinkingShown = false;
 
 	constructor(
 		private readonly isPassthroughTool: (toolName: string) => boolean = () => false,
@@ -1093,7 +1105,9 @@ export class AggregateProjection {
 
 	clearViewportState(): void {
 		this.viewportRuns.clear();
+		this.thinkingRuns.clear();
 		resetAggregateViewportOwner(this);
+		resetAggregateViewportOwner(this.thinkingViewportOwner);
 	}
 
 	toggleGroupExpansionFromComponent(itemId: string, component: object): void {
@@ -1307,6 +1321,219 @@ export class AggregateProjection {
 		return group && host ? this.buildGroupView(group, host) : undefined;
 	}
 
+	/** Host Pi's hideThinkingBlock is the single switch; hidden thinking never gets a block. */
+	setThinkingShown(shown: boolean): void {
+		if (this.thinkingShown === shown) return;
+		this.thinkingShown = shown;
+		const hosts = [...this.thinkingHosts.values()];
+		this.thinkingHosts.clear();
+		this.thinkingSignatures.clear();
+		this.invalidateThinkingKeys(...hosts, ...this.thinkingTurnSegments().map((id) => this.thinkingHostKey(id)));
+	}
+
+	isThinkingShown(): boolean {
+		return this.thinkingShown;
+	}
+
+	/** The Run block's last painted row hosts Thinking: collapsed summary or expanded frame end. */
+	getRunThinkingBlock(itemId: string, expanded: boolean): AggregateThinkingBlock | undefined {
+		// Called on every frame by Run hosts: transcripts without thinking pay one size check.
+		if (!this.thinkingShown || this.thinkingByTurn.size === 0) return undefined;
+		const group = this.displayGroupForItem(itemId);
+		if (!group) return undefined;
+		const host = expanded ? this.expandedRunEnd(group) : this.collapsedHost(group);
+		if (host !== itemId) return undefined;
+		return this.claimThinking(group, itemId);
+	}
+
+	/** Without a Run in the segment, the latest assistant message hosts Thinking above its body. */
+	getTurnThinkingBlock(message: unknown): AggregateThinkingBlock | undefined {
+		if (!this.thinkingShown || this.thinkingByTurn.size === 0) return undefined;
+		const turnId = this.contextTurnId(message);
+		const group = turnId ? this.displayGroupForItem(turnId) : undefined;
+		if (!turnId || !group || this.collapsedHost(group) || group.agentTurnIds.at(-1) !== turnId) return undefined;
+		return this.claimThinking(group, turnId);
+	}
+
+	noteThinkingEvent(message: unknown, event: unknown): void {
+		const type = toRecord(event).type;
+		const turnId = this.contextTurnId(message);
+		if (!turnId) return;
+		if (type === "thinking_start" || type === "thinking_delta") {
+			if (this.activeThinkingTurn === turnId) return;
+			this.activeThinkingTurn = turnId;
+			this.interruptedThinking.delete(turnId);
+		} else if (this.activeThinkingTurn === turnId
+			&& ["thinking_end", "text_start", "toolcall_start", "done", "error"].includes(String(type))) {
+			this.activeThinkingTurn = undefined;
+		} else return;
+		this.refreshThinking(turnId);
+	}
+
+	endThinking(message: unknown): void {
+		const turnId = this.contextTurnId(message);
+		if (!turnId || this.activeThinkingTurn !== turnId) return;
+		this.activeThinkingTurn = undefined;
+		this.refreshThinking(turnId);
+	}
+
+	/** Settled while still thinking: never shown as completed. */
+	interruptThinking(): void {
+		const turnId = this.activeThinkingTurn;
+		if (!turnId) return;
+		this.activeThinkingTurn = undefined;
+		this.interruptedThinking.add(turnId);
+		this.refreshThinking(turnId);
+	}
+
+	private recordThinking(message: unknown): void {
+		const turnId = this.contextTurnId(message);
+		if (!turnId) return;
+		if (hasThinkingText(message)) this.thinkingByTurn.set(turnId, message);
+		else if (!this.thinkingByTurn.has(turnId)) return;
+		else this.thinkingByTurn.delete(turnId);
+		this.refreshThinking(turnId);
+	}
+
+	private migrateThinkingTurn(previousId: string, id: string): void {
+		const message = this.thinkingByTurn.get(previousId);
+		if (message !== undefined) {
+			this.thinkingByTurn.delete(previousId);
+			this.thinkingByTurn.set(id, message);
+		}
+		this.thinkingParts.delete(previousId);
+		if (this.activeThinkingTurn === previousId) this.activeThinkingTurn = id;
+		if (this.interruptedThinking.delete(previousId)) this.interruptedThinking.add(id);
+		for (const [segment, host] of this.thinkingHosts) if (host === previousId) this.thinkingHosts.set(segment, id);
+	}
+
+	private resetThinking(): void {
+		this.thinkingByTurn.clear();
+		this.thinkingParts.clear();
+		this.interruptedThinking.clear();
+		this.thinkingHosts.clear();
+		this.thinkingSignatures.clear();
+		this.activeThinkingTurn = undefined;
+	}
+
+	private segmentIdOf(group: AggregateGroup): string {
+		const segment = this.segmentForItem(group.agentTurnIds[0] ?? group.framedItemIds[0] ?? group.groupId);
+		return segment?.id ?? group.groupId;
+	}
+
+	private thinkingTurnSegments(): string[] {
+		return [...new Set([...this.thinkingByTurn.keys()].map((turnId) => this.segmentForItem(turnId)?.id ?? turnId))];
+	}
+
+	/** Last row painted by the expanded Run: tools, custom messages and visible narration. */
+	private expandedRunEnd(group: AggregateGroup): string | undefined {
+		return group.framedItemIds.findLast((id) => {
+			if (this.customMessages.has(id)) return !this.emptyCustomFrames.has(id);
+			const member = this.membersById.get(id);
+			if (member) return member.visible && member.state !== "needsAttention" && !this.isPassthrough(member.toolName);
+			return this.visibleFrameContent.has(id);
+		});
+	}
+
+	private thinkingHostKey(itemId: string): string | undefined {
+		const group = this.displayGroupForItem(itemId);
+		if (!group) return undefined;
+		if (!this.collapsedHost(group)) return group.agentTurnIds.at(-1);
+		return this.isItemExpanded(itemId) ? this.expandedRunEnd(group) : this.collapsedHost(group);
+	}
+
+	private thinkingBlockFor(group: AggregateGroup): AggregateThinkingBlock | undefined {
+		const segmentId = this.segmentIdOf(group);
+		const expanded = this.expandedThinking.has(segmentId);
+		const parts: AggregateThinkingPart[] = [];
+		for (const turnId of group.agentTurnIds) {
+			const source = this.thinkingByTurn.get(turnId);
+			if (source === undefined) continue;
+			let part = this.thinkingParts.get(turnId);
+			if (!part || part.source !== source) {
+				part = { turnId, source, calls: [], cache: part?.cache };
+				this.thinkingParts.set(turnId, part);
+			}
+			// Call annotations are only painted inside an expanded block.
+			if (expanded) part.calls = toolCallsFromMessage(source).map((call) => formatAggregateTarget(this.membersById.get(call.id) ?? { toolName: call.name, args: call.args }));
+			parts.push(part);
+		}
+		if (!parts.length) return undefined;
+		const block: AggregateThinkingBlock = {
+			segmentId, parts, expanded,
+			status: this.thinkingStatus(group, parts),
+			run: this.thinkingRun(segmentId),
+			toggle: () => this.toggleThinking(segmentId),
+		};
+		return block;
+	}
+
+	private thinkingStatus(group: AggregateGroup, parts: readonly AggregateThinkingPart[]): AggregateThinkingStatus {
+		if (this.activeThinkingTurn && group.agentTurnIds.includes(this.activeThinkingTurn)) return "active";
+		const last = parts.at(-1)!;
+		if (this.interruptedThinking.has(last.turnId)) return "interrupted";
+		const message = toRecord(last.source);
+		const content = messageContent(message);
+		const endsInThinking = toRecord(content.at(-1)).type === "thinking";
+		if (endsInThinking && message.stopReason === "aborted") return "interrupted";
+		if (endsInThinking && (message.stopReason === "error" || message.stopReason === "length")) return "failed";
+		return "done";
+	}
+
+	private claimThinking(group: AggregateGroup, hostKey: string): AggregateThinkingBlock | undefined {
+		const block = this.thinkingBlockFor(group);
+		if (!block) return undefined;
+		const previous = this.thinkingHosts.get(block.segmentId);
+		this.thinkingHosts.set(block.segmentId, hostKey);
+		// A Run appearing (or Ctrl+O) moves the block; the old host must repaint without it.
+		if (previous && previous !== hostKey) this.invalidateThinkingKeys(previous);
+		return block;
+	}
+
+	/** Streaming deltas repaint only when visible output changes: folded text growth is free. */
+	private refreshThinking(turnId: string): void {
+		if (!this.thinkingShown) return;
+		const group = this.displayGroupForItem(turnId);
+		if (!group) return;
+		const block = this.thinkingBlockFor(group);
+		const segmentId = this.segmentIdOf(group);
+		const signature = block
+			? `${block.parts.length}|${block.status}|${block.expanded ? block.parts.map((part) => thinkingSize(part.source)).join(",") : ""}`
+			: "";
+		if (this.thinkingSignatures.get(segmentId) === signature) return;
+		this.thinkingSignatures.set(segmentId, signature);
+		this.invalidateThinkingKeys(this.thinkingHosts.get(segmentId), this.thinkingHostKey(turnId));
+	}
+
+	private thinkingRun(segmentId: string): AggregateViewportRun {
+		const cached = this.thinkingRuns.get(segmentId);
+		if (cached) return cached;
+		const run: AggregateViewportRun = {
+			owner: this.thinkingViewportOwner, id: `thinking:${segmentId}`,
+			isValid: () => this.thinkingRuns.get(segmentId) === run && this.thinkingShown,
+			isExpanded: () => this.expandedThinking.has(segmentId),
+			toggle: () => this.toggleThinking(segmentId),
+			label: () => "Thinking",
+		};
+		this.thinkingRuns.set(segmentId, run);
+		return run;
+	}
+
+	/** Independent of Ctrl+O and Run expansion. */
+	toggleThinking(segmentId: string): void {
+		if (!this.expandedThinking.delete(segmentId)) this.expandedThinking.add(segmentId);
+		this.thinkingSignatures.delete(segmentId);
+		this.invalidateThinkingKeys(this.thinkingHosts.get(segmentId));
+	}
+
+	private invalidateThinkingKeys(...keys: Array<string | undefined>): void {
+		const ids = [...new Set(keys.filter((key): key is string => Boolean(key)))];
+		this.invalidateIds(...ids);
+		for (const id of ids) {
+			try { this.contextInvalidators.get(id)?.(); } catch { /* Disposed transcript component. */ }
+		}
+	}
+
 	private groupIdForFrameItem(itemId: string, beforeId?: string): string | undefined {
 		if (beforeId) {
 			const fromTool = this.membersById.get(beforeId)?.groupId ?? this.framedGroupById.get(beforeId);
@@ -1386,6 +1613,7 @@ export class AggregateProjection {
 			const invalidate = this.contextInvalidators.get(previousId);
 			if (invalidate) this.contextInvalidators.set(id, invalidate);
 			this.contextInvalidators.delete(previousId);
+			this.migrateThinkingTurn(previousId, id);
 		}
 		if (!group.agentTurnIds.includes(id)) group.agentTurnIds.push(id);
 		if (message && typeof message === "object") this.turnIdsByMessage.set(message, id);
@@ -1622,6 +1850,7 @@ export class AggregateProjection {
 			}
 		}
 		this.maybeSettleFromTerminalAssistant(message);
+		this.recordThinking(message);
 		if (known && known.groupId !== savedGroup) {
 			this.activeGroupId = savedGroup;
 			this.customBoundary = savedBoundary;
@@ -1792,6 +2021,7 @@ export class AggregateProjection {
 		this.visibleFrameContent.clear();
 		this.frameInvalidators.clear();
 		this.assignedSteerIds.clear();
+		this.resetThinking();
 		this.sourceOrder = 0;
 		this.completionOrder = 0;
 		this.activeGroupId = undefined;
@@ -1864,6 +2094,7 @@ export class AggregateProjection {
 		for (const key of this.expandedGroups.keys()) {
 			if (!expansionKeys.has(key)) this.expandedGroups.delete(key);
 		}
+		for (const id of this.expandedThinking) if (!this.segmentsById.has(id)) this.expandedThinking.delete(id);
 		this.rebuildContextGrowth(projectedEntries);
 		this.syncRunPulse();
 	}
@@ -2320,6 +2551,25 @@ export function padAggregateBlock(lines: readonly string[]): string[] {
 	return lines.length > 0 ? ["", ...lines, ""] : [];
 }
 
+/** Append the segment Thinking block below a Run host's rows; registers its click target in `regions`. */
+export function attachRunThinking(
+	projection: AggregateProjection,
+	itemId: string,
+	expanded: boolean,
+	lines: string[],
+	width: number,
+	regions: AggregateClickRegion[],
+	component: object,
+): { titleRow: number; viewport: { run: AggregateViewportRun; titleRow: number } } | undefined {
+	const block = projection.getRunThinkingBlock(itemId, expanded);
+	if (!block) return undefined;
+	const rendered = renderAggregateThinkingBlock(block, width, projection.getRenderTheme());
+	if (!rendered.length) return undefined;
+	const titleRow = appendThinkingBlock(lines, rendered);
+	regions.push({ startRow: titleRow, endRow: titleRow + 1, onClick: () => toggleAggregateViewportRun(component, block.run) });
+	return { titleRow, viewport: { run: block.run, titleRow } };
+}
+
 export function attachExpandedAggregateSummary(
 	header: readonly string[],
 	detail: readonly string[],
@@ -2575,7 +2825,7 @@ export function patchAggregateToolExecutions(projection: AggregateProjection): v
 		const toggle = () => activeProjection.toggleGroupExpansionFromComponent(toolCallId, this);
 		if (activeProjection.isItemExpanded(toolCallId, this.expanded === true)) {
 			const detail = activeProjection.renderExpandedToolRowLayout(toolCallId, width);
-			let lines = detail.lines;
+			let lines = [...detail.lines];
 			let offset = 0;
 			if (activeProjection.shouldHostExpandedSummary(toolCallId)) {
 				const headerView = activeProjection.getSegmentView(toolCallId);
@@ -2586,16 +2836,24 @@ export function patchAggregateToolExecutions(projection: AggregateProjection): v
 					regions.push({ startRow: 1, endRow: offset, onClick: toggle });
 				}
 			}
-			regions.push({ startRow: offset + detail.callStart, endRow: lines.length, onClick: () => activeProjection.openDetail({
+			const callEnd = lines.length;
+			regions.push({ startRow: offset + detail.callStart, endRow: callEnd, onClick: () => activeProjection.openDetail({
 				kind: "tool", toolName, target: formatAggregateTarget(member), args: this.args, result: this.result,
 				status: member.state, timing: formatMemberTiming(member, PLAIN_THEME),
 			}) });
-			recordAggregateClickRegions(this, width, lines.length, regions, run ? { run, ...(offset > 0 ? { titleRow: 1 } : {}) } : undefined);
+			const runRegion = run ? { run, ...(offset > 0 ? { titleRow: 1 } : {}) } : undefined;
+			const thinking = attachRunThinking(activeProjection, toolCallId, true, lines, width, regions, this);
+			const viewports = [...(runRegion ? [{ ...runRegion, ...(thinking ? { endRow: thinking.titleRow } : {}) }] : []), ...(thinking ? [thinking.viewport] : [])];
+			recordAggregateClickRegions(this, width, lines.length, regions, viewports.length ? viewports : undefined);
 			return lines;
 		}
 		if (!view) return [];
 		const lines = padAggregateBlock(renderAggregateActivity(view, width, activeProjection.getRenderTheme()));
-		recordAggregateClickRegions(this, width, lines.length, [{ startRow: 1, endRow: lines.length - 1, onClick: toggle }], run ? { run, titleRow: 1 } : undefined);
+		regions.push({ startRow: 1, endRow: lines.length - 1, onClick: toggle });
+		const thinking = attachRunThinking(activeProjection, toolCallId, false, lines, width, regions, this);
+		if (thinking) regions[0]!.endRow = thinking.titleRow;
+		const viewports = [...(run ? [{ run, titleRow: 1, ...(thinking ? { endRow: thinking.titleRow } : {}) }] : []), ...(thinking ? [thinking.viewport] : [])];
+		recordAggregateClickRegions(this, width, lines.length, regions, viewports.length ? viewports : undefined);
 		return lines;
 	};
 	Object.defineProperty(prototype, AGGREGATE_TOOL_EXECUTION_PATCH_KEY, {
@@ -2721,10 +2979,16 @@ export function registerAggregateProjectionEvents(
 			projection.ingestUserMessage(event.message, { streamingBehavior: behavior });
 		}
 	});
-	pi.on("message_update", async (event) => projection.ingestAssistantMessage(event.message));
+	pi.on("message_update", async (event) => {
+		projection.ingestAssistantMessage(event.message);
+		projection.noteThinkingEvent(event.message, (event as { assistantMessageEvent?: unknown }).assistantMessageEvent);
+	});
 	pi.on("message_end", async (event) => {
 		const role = messageRole(event.message);
-		if (role === "assistant") projection.ingestAssistantMessage(event.message);
+		if (role === "assistant") {
+			projection.ingestAssistantMessage(event.message);
+			projection.endThinking(event.message);
+		}
 		else if (role === "toolResult") projection.ingestToolResult(event.message);
 	});
 	pi.on("turn_end", async (event, ctx) => {
@@ -2739,6 +3003,7 @@ export function registerAggregateProjectionEvents(
 		projection.markComplete(event.toolCallId, event.result, event.isError === true);
 	});
 	pi.on("agent_settled", async () => {
+		projection.interruptThinking();
 		projection.markUnsettledInterrupted();
 		projection.markGroupSettled();
 		clearSettleTimer();

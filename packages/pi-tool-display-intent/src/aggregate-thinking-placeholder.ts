@@ -7,14 +7,18 @@ import {
 	aggregateAssistantFrameId,
 	applyAggregateGroupFrame,
 	attachExpandedAggregateSummary,
+	attachRunThinking,
 	framePrefixForEdge,
 	renderExpandedAggregateSummary,
 	resolveAggregateProjection,
 	resolveAggregateRenderTheme,
+	type AggregateProjection,
 } from "./aggregate-activity.js";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { patchAggregateMouseHandling, recordAggregateClickRegions, releaseAggregateClickRegions, restoreAggregateMouseHandling } from "./aggregate-interaction.js";
+import { patchAggregateMouseHandling, recordAggregateClickRegions, recordAggregateNativeRegion, releaseAggregateClickRegions, restoreAggregateMouseHandling, type AggregateClickRegion } from "./aggregate-interaction.js";
 import { hasPromptZoneStart, markPromptZone, stripPromptZone } from "./prompt-zone-markers.js";
+import { renderAggregateThinkingBlock, type AggregateThinkingBlock } from "./aggregate-thinking-block.js";
+import { toggleAggregateViewportRun } from "./aggregate-viewport.js";
 
 interface PatchableAssistantMessage {
 	render(width: number): string[];
@@ -250,6 +254,20 @@ function getPrototype(): PatchableAssistantPrototype {
 	return AssistantMessageComponent.prototype as unknown as PatchableAssistantPrototype;
 }
 
+/** Without a Run in its segment, the latest assistant message hosts the Thinking block. */
+function turnThinking(
+	component: PatchableAssistantMessage,
+	projection: AggregateProjection | undefined,
+	width: number,
+): { block: AggregateThinkingBlock; lines: string[]; region: AggregateClickRegion } | undefined {
+	const block = projection?.getTurnThinkingBlock(component.lastMessage);
+	if (!block) return undefined;
+	const lines = renderAggregateThinkingBlock(block, width, resolveAggregateRenderTheme(projection));
+	if (!lines.length) return undefined;
+	// Row 1: callers put the block below the native leading blank.
+	return { block, lines, region: { startRow: 1, endRow: 2, onClick: () => toggleAggregateViewportRun(component, block.run) } };
+}
+
 export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boolean): void {
 	if (THINKING_MODULE.retired) return;
 	const prototype = getPrototype();
@@ -303,9 +321,12 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 		const interim = isInterimAssistantNarration(this);
 		const hasNarrationText = messageHasNarrationText(this.lastMessage);
 		const stopReason = toRecord(this.lastMessage).stopReason;
-		// Thinking is never narration. Drop thinking blocks before render so
-		// overlapping final text cannot be mistaken for reasoning.
-		const stripThinkingBody = hideThinking || interim || (stopReason === "stop" && hasNarrationText);
+		const toolCallId = firstToolCallId(this.lastMessage);
+		const frameId = assistantFrameId(this);
+		const projection = resolveAggregateProjection(undefined, frameId, toolCallId);
+		// Thinking is never narration. With a projection, shown thinking moves to the
+		// segment Thinking block and hidden thinking is dropped; without one, keep Pi's.
+		const stripThinkingBody = hideThinking || projection !== undefined || interim || (stopReason === "stop" && hasNarrationText);
 		// Native Markdown pads every row to the width it receives. Reserve the
 		// frame and narration marker before layout, not by clipping padded rows
 		// afterwards (which also turns blank lines into full-width ellipses).
@@ -326,9 +347,7 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 		}
 		const markHostPromptZone = (lines: string[]): string[] => body.hostMarkedPromptZone ? markPromptZone(lines) : lines;
 		const next = body.lines;
-		const toolCallId = firstToolCallId(this.lastMessage);
-		const frameId = assistantFrameId(this);
-		const projection = resolveAggregateProjection(undefined, frameId, toolCallId);
+		projection?.setThinkingShown(!hideThinking);
 		projection?.connectContextRenderer(this.lastMessage, () => invalidateDecoration(this));
 		const expanded = projection?.isMessageExpanded(this.lastMessage, isExpanded(this, projection?.isTimelineExpanded()))
 			?? isExpanded(this);
@@ -339,7 +358,12 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 				projection?.markFrameContentVisible(frameId, false);
 				if (!hasNarrationText || trimmed.length === 0) projection?.untrackFramedItem(frameId);
 				else projection?.trackFramedItem(frameId, undefined, toolCallId);
-				return [];
+				// Hidden narration only paints Thinking when its segment has no Run to host it.
+				const fallback = turnThinking(this, projection, width);
+				if (!fallback) return [];
+				const lines = ["", ...fallback.lines, ""];
+				recordAggregateClickRegions(this, width, lines.length, [fallback.region], { run: fallback.block.run, titleRow: 1 });
+				return lines;
 			}
 			projection?.trackFramedItem(frameId, undefined, toolCallId);
 			projection?.connectFrameRenderer(frameId, () => invalidateDecoration(this));
@@ -347,6 +371,19 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 		}
 		const contextLines = interim ? [] : (projection?.getAssistantContextLines(this.lastMessage, expanded) ?? [])
 			.map((line) => truncateToWidth(`  ${resolveAggregateRenderTheme(projection).fg("muted", line)}`, Math.max(0, width), "…"));
+		const ownThinking = interim ? undefined : turnThinking(this, projection, width);
+		if (ownThinking) {
+			// [Run] → Thinking → answer: no Run here, so the block sits above this body.
+			const lines = ["", ...ownThinking.lines];
+			const bodyTop = lines.length;
+			if (trimmed.length) lines.push("", ...trimmed);
+			lines.push(...contextLines);
+			const viewport = { run: ownThinking.block.run, titleRow: 1 };
+			// The separator row stands in for the native leading Spacer of the stripped body.
+			if (trimmed.length) recordAggregateNativeRegion(this, width, lines.length, { left: 0, top: bodyTop, width, height: trimmed.length + 1 }, [ownThinking.region], viewport);
+			else recordAggregateClickRegions(this, width, lines.length, [ownThinking.region], viewport);
+			return toolCallId ? lines : markPromptZone(lines);
+		}
 		if (trimmed.length === 0) return markHostPromptZone(contextLines.length > 0 ? ["", ...contextLines] : []);
 		if (!interim) {
 			// Thinking-placeholder cleanup also trims Pi's leading Spacer(1).
@@ -363,17 +400,23 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 		const edge = projection?.getFrameEdge(frameId) ?? "only";
 		const framed = applyAggregateGroupFrame(inner, width, theme, edge);
 		const run = projection?.getViewportRun(frameId);
+		let lines = [...framed];
+		let titleRow: number | undefined;
+		const regions: AggregateClickRegion[] = [];
 		if (projection?.shouldHostExpandedSummary(frameId)) {
 			const headerView = projection.getSegmentView(frameId);
 			if (headerView) {
 				const header = renderExpandedAggregateSummary(headerView, width, theme);
-				const lines = attachExpandedAggregateSummary(header, framed);
-				recordAggregateClickRegions(this, width, lines.length, [{ startRow: 1, endRow: 1 + header.length, onClick: () => projection.toggleGroupExpansionFromComponent(frameId, this) }], run ? { run, titleRow: 1 } : undefined);
-				return markHostPromptZone(lines);
+				lines = attachExpandedAggregateSummary(header, framed);
+				regions.push({ startRow: 1, endRow: 1 + header.length, onClick: () => projection.toggleGroupExpansionFromComponent(frameId, this) });
+				titleRow = 1;
 			}
 		}
-		recordAggregateClickRegions(this, width, framed.length, [], run ? { run } : undefined);
-		return markHostPromptZone(framed);
+		const thinking = projection ? attachRunThinking(projection, frameId, true, lines, width, regions, this) : undefined;
+		const runRegion = run ? { run, ...(titleRow !== undefined ? { titleRow } : {}), ...(thinking ? { endRow: thinking.titleRow } : {}) } : undefined;
+		const viewports = [...(runRegion ? [runRegion] : []), ...(thinking ? [thinking.viewport] : [])];
+		recordAggregateClickRegions(this, width, lines.length, regions, viewports.length ? viewports : undefined);
+		return markHostPromptZone(lines);
 	};
 	Object.defineProperty(prototype, AGGREGATE_THINKING_PATCH_KEY, {
 		configurable: true,

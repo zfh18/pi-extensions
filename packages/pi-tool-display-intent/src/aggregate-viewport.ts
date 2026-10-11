@@ -14,7 +14,7 @@ export interface AggregateViewportControl {
 	collapse(): void;
 }
 
-type Region = { run: AggregateViewportRun; width: number; height: number; titleRow?: number };
+type Region = { run: AggregateViewportRun; width: number; height: number; titleRow?: number; endRow?: number };
 type RecordedRegion = Region & { generation: number };
 type Rect = { x: number; y: number; width: number; height: number };
 type CachedComponent = {
@@ -82,7 +82,7 @@ type Transaction = {
 };
 
 const HOOK = Symbol.for("@zhcsyncer/pi-tool-display-intent/aggregate-viewport");
-let regions = new WeakMap<object, RecordedRegion>();
+let regions = new WeakMap<object, RecordedRegion[]>();
 let receivers = new WeakMap<object, RendererState>();
 const generations = new WeakMap<object, number>();
 const renderers = new Map<Renderer, RendererState>();
@@ -102,12 +102,18 @@ function valid(region: RecordedRegion): boolean {
 }
 
 export function recordAggregateViewportRegion(component: object, region: Region): void {
-	if (!size(region.width) || region.width === 0 || !size(region.height)
-		|| (region.titleRow !== undefined && (!size(region.titleRow) || region.titleRow >= region.height))) {
+	recordAggregateViewportRegions(component, [region]);
+}
+
+/** One component may host a Run and the segment Thinking block below it. */
+export function recordAggregateViewportRegions(component: object, values: readonly Region[]): void {
+	if (!values.length || values.some(region => !size(region.width) || region.width === 0 || !size(region.height)
+		|| (region.titleRow !== undefined && (!size(region.titleRow) || region.titleRow >= region.height))
+		|| (region.endRow !== undefined && (!size(region.endRow) || region.endRow > region.height)))) {
 		releaseAggregateViewportRegion(component);
 		return;
 	}
-	regions.set(component, { ...region, generation: generation(region.run.owner) });
+	regions.set(component, values.map(region => ({ ...region, generation: generation(region.run.owner) })));
 }
 
 export function releaseAggregateViewportRegion(component: object): void {
@@ -124,7 +130,7 @@ function addRegion(ledger: Ledger, component: object, region: RecordedRegion, ro
 		run: region.run, end: 0, components: new Set(), expanded: region.run.isExpanded(),
 	});
 	geometry.components.add(component);
-	geometry.end = Math.max(geometry.end, Math.min(end, row + region.height));
+	geometry.end = Math.max(geometry.end, Math.min(end, row + (region.endRow ?? region.height)));
 	if (region.titleRow !== undefined) {
 		const title = row + region.titleRow;
 		if (title >= top && title < end) {
@@ -137,9 +143,9 @@ function addRegion(ledger: Ledger, component: object, region: RecordedRegion, ro
 /** Ordinary Containers are opaque to LayoutBox. Only their last native render can supply child offsets.
  * A recorded host is also opaque: its replaced render deliberately does not update native mouseLayout. */
 function walkCached(component: object, width: number, height: number, row: number, top: number, end: number, ledger: Ledger): void {
-	const region = regions.get(component);
-	if (region) {
-		if (region.width === width && region.height === height) addRegion(ledger, component, region, row, top, end);
+	const recorded = regions.get(component);
+	if (recorded) {
+		for (const region of recorded) if (region.width === width && region.height === height) addRegion(ledger, component, region, row, top, end);
 		return;
 	}
 	const container = component as CachedComponent;
@@ -370,8 +376,8 @@ function performToggle(state: RendererState | undefined, run: AggregateViewportR
 }
 
 export function toggleAggregateViewportRun(component: object, run: AggregateViewportRun): void {
-	const region = regions.get(component);
-	const state = region && valid(region) && region.run.owner === run.owner && region.run.id === run.id ? receivers.get(component) : undefined;
+	const region = regions.get(component)?.find(region => valid(region) && region.run.owner === run.owner && region.run.id === run.id);
+	const state = region ? receivers.get(component) : undefined;
 	performToggle(state, run);
 }
 
@@ -392,7 +398,7 @@ export function resetAggregateViewportOwner(owner: object): void {
 	for (const state of renderers.values()) {
 		state.viewport?.ledger.delete(owner);
 		for (const component of state.components) {
-			if (regions.get(component)?.run.owner !== owner) continue;
+			if (!regions.get(component)?.some(region => region.run.owner === owner)) continue;
 			state.components.delete(component);
 			if (receivers.get(component) === state) receivers.delete(component);
 		}

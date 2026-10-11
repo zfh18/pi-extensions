@@ -1,11 +1,13 @@
 import type { TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { recordAggregateViewportRegion, releaseAggregateViewportRegion, type AggregateViewportRun } from "./aggregate-viewport.js";
+import { recordAggregateViewportRegions, releaseAggregateViewportRegion, type AggregateViewportRun } from "./aggregate-viewport.js";
 
 export interface AggregateClickRegion {
 	startRow: number;
 	endRow: number;
 	onClick(): void;
 }
+
+export type AggregateViewportRegions = { run: AggregateViewportRun; titleRow?: number; endRow?: number };
 
 interface HitMap {
 	width: number;
@@ -38,10 +40,10 @@ export function recordAggregateClickRegions(
 	width: number,
 	height: number,
 	regions: readonly AggregateClickRegion[] = [],
-	viewport?: { run: AggregateViewportRun; titleRow?: number },
+	viewport?: AggregateViewportRegions | readonly AggregateViewportRegions[],
 ): void {
 	hitMaps.set(instance, { width, height, regions });
-	if (viewport) recordAggregateViewportRegion(instance, { ...viewport, width, height });
+	if (viewport) recordAggregateViewportRegions(instance, (Array.isArray(viewport) ? viewport : [viewport]).map(region => ({ ...region, width, height })));
 	else releaseAggregateViewportRegion(instance);
 }
 
@@ -57,7 +59,7 @@ export function recordAggregateNativeRegion(
 	height: number,
 	native: NonNullable<HitMap["native"]>,
 	regions: readonly AggregateClickRegion[] = [],
-	viewport?: { run: AggregateViewportRun; titleRow?: number },
+	viewport?: AggregateViewportRegions | readonly AggregateViewportRegions[],
 ): void {
 	recordAggregateClickRegions(instance, width, height, regions, viewport);
 	hitMaps.get(instance)!.native = native;

@@ -3,6 +3,7 @@ import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import {
 	applyAggregateGroupFrame,
 	attachExpandedAggregateSummary,
+	attachRunThinking,
 	getActiveAggregateProjection,
 	padAggregateBlock,
 	renderAggregateActivity,
@@ -188,9 +189,11 @@ export function patchAggregateCustomMessages(): void {
 			const view = projection.getView(id);
 			if (!view) return [];
 			const lines = padAggregateBlock(renderAggregateActivity(view, width, theme));
-			recordAggregateClickRegions(this, width, lines.length,
-				[{ startRow: 1, endRow: lines.length - 1, onClick: toggle }],
-				run ? { run, titleRow: 1 } : undefined);
+			const collapsedRegions: AggregateClickRegion[] = [{ startRow: 1, endRow: lines.length - 1, onClick: toggle }];
+			const thinking = attachRunThinking(projection, id, false, lines, width, collapsedRegions, this);
+			if (thinking) collapsedRegions[0]!.endRow = thinking.titleRow;
+			const viewports = [...(run ? [{ run, titleRow: 1, ...(thinking ? { endRow: thinking.titleRow } : {}) }] : []), ...(thinking ? [thinking.viewport] : [])];
+			recordAggregateClickRegions(this, width, lines.length, collapsedRegions, viewports.length ? viewports : undefined);
 			return lines;
 		}
 		let lines = applyAggregateGroupFrame(body, width, theme, projection.getFrameEdge(id) ?? "only");
@@ -205,9 +208,13 @@ export function patchAggregateCustomMessages(): void {
 				regions.push({ startRow: 1, endRow: top, onClick: toggle });
 			}
 		}
+		const bodyHeight = lines.length;
+		const thinking = attachRunThinking(projection, id, true, lines, width, regions, this);
+		const runRegion = run ? { run, ...(top > 0 ? { titleRow: 1 } : {}), ...(thinking ? { endRow: thinking.titleRow } : {}) } : undefined;
+		const viewports = [...(runRegion ? [runRegion] : []), ...(thinking ? [thinking.viewport] : [])];
 		recordAggregateNativeRegion(this, width, lines.length,
-			{ left: 4, top, width: innerWidth, height: body.length }, regions,
-			run ? { run, ...(top > 0 ? { titleRow: 1 } : {}) } : undefined);
+			{ left: 4, top, width: innerWidth, height: Math.min(body.length, bodyHeight - top) }, regions,
+			viewports.length ? viewports : undefined);
 		return lines;
 	};
 }

@@ -106,6 +106,8 @@ pi install npm:@zhcsyncer/pi-extensions
 
 steer 消息按终端宽度换行：不超过 8 行内容时完整显示，超过后保留头 3 行、尾 2 行，中间显示 `… N lines hidden · click to view`。点击省略行查看原始消息。Run 开合与 `Ctrl+O` 不改变此预览；Pi 的上一条／下一条消息快捷键仍可跳到每条 steer。
 
+Pi 显示 thinking 时，每个 Run 段的思考收进一个默认收起的 `● Thinking` 块，位于 Run 下方、回答正文上方；没有 Run 时直接放在回答上方。圆点是静态的：思考中黄色，完成后绿色，中断为灰色。点击标题只展开这一块：各段思考按时间顺序排列，每段后附它引出的调用。`Ctrl+O` 不开合 Thinking，展开的 Run 也不含思考。steer 像分隔 Run 一样分隔 Thinking。在 Pi 中关闭 thinking 显示后，不显示任何 Thinking 块。
+
 ### 上下文增长
 
 在 aggregate 下打开 `/tools`，将 **Context growth** 设为 on（默认 off）。收据显示整个 run 的净增长；把 **Expanded timeline** 设为 **turns**，可查看各拍贡献：
