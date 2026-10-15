@@ -18,7 +18,7 @@ import { createAggregateCollapseWidget } from "./aggregate-collapse-widget.js";
 import type { DetailRequest } from "./detail-viewer.js";
 import { lookupAggregateCallPresentation } from "./call-presentation-registry.js";
 import { getDisplaySummary, normalizeDisplaySummary, stripDisplaySummary } from "./display-summary.js";
-import { appendThinkingBlock, hasThinkingText, renderAggregateThinkingBlock, thinkingSize, type AggregateThinkingBlock, type AggregateThinkingPart, type AggregateThinkingStatus } from "./aggregate-thinking-block.js";
+import { appendThinkingBlock, hasThinkingText, renderAggregateThinkingBlock, thinkingSize, thinkingTargets, type AggregateThinkingBlock, type AggregateThinkingPart, type AggregateThinkingStatus } from "./aggregate-thinking-block.js";
 import type { ExpandedTimeline, ToolDisplayConfig } from "./types.js";
 import { layoutPreviewRows } from "./preview-text.js";
 import { pluralize, shortenPath } from "./render-utils.js";
@@ -883,6 +883,9 @@ export class AggregateProjection {
 	private readonly thinkingByTurn = new Map<string, unknown>();
 	private readonly thinkingParts = new Map<string, AggregateThinkingPart>();
 	private readonly expandedThinking = new Set<string>();
+	/** Turn ids of parts opened inside a multi-part Thinking block. */
+	private readonly expandedThinkingParts = new Set<string>();
+	private readonly thinkingPartRuns = new Map<string, AggregateViewportRun>();
 	private readonly interruptedThinking = new Set<string>();
 	private readonly thinkingHosts = new Map<string, string>();
 	private readonly thinkingSignatures = new Map<string, string>();
@@ -1106,6 +1109,7 @@ export class AggregateProjection {
 	clearViewportState(): void {
 		this.viewportRuns.clear();
 		this.thinkingRuns.clear();
+		this.thinkingPartRuns.clear();
 		resetAggregateViewportOwner(this);
 		resetAggregateViewportOwner(this.thinkingViewportOwner);
 	}
@@ -1402,6 +1406,8 @@ export class AggregateProjection {
 			this.thinkingByTurn.set(id, message);
 		}
 		this.thinkingParts.delete(previousId);
+		this.thinkingPartRuns.delete(previousId);
+		if (this.expandedThinkingParts.delete(previousId)) this.expandedThinkingParts.add(id);
 		if (this.activeThinkingTurn === previousId) this.activeThinkingTurn = id;
 		if (this.interruptedThinking.delete(previousId)) this.interruptedThinking.add(id);
 		for (const [segment, host] of this.thinkingHosts) if (host === previousId) this.thinkingHosts.set(segment, id);
@@ -1451,9 +1457,11 @@ export class AggregateProjection {
 			if (source === undefined) continue;
 			let part = this.thinkingParts.get(turnId);
 			if (!part || part.source !== source) {
-				part = { turnId, source, calls: [], cache: part?.cache };
+				part = { turnId, source, calls: [], status: "done", expanded: false, run: this.thinkingPartRun(turnId), cache: part?.cache };
 				this.thinkingParts.set(turnId, part);
 			}
+			part.status = this.thinkingPartStatus(part);
+			part.expanded = this.expandedThinkingParts.has(turnId);
 			// Call annotations are only painted inside an expanded block.
 			if (expanded) part.calls = toolCallsFromMessage(source).map((call) => formatAggregateTarget(this.membersById.get(call.id) ?? { toolName: call.name, args: call.args }));
 			parts.push(part);
@@ -1461,20 +1469,18 @@ export class AggregateProjection {
 		if (!parts.length) return undefined;
 		const block: AggregateThinkingBlock = {
 			segmentId, parts, expanded,
-			status: this.thinkingStatus(group, parts),
+			status: parts.some((part) => part.status === "active") ? "active" : parts.at(-1)!.status,
 			run: this.thinkingRun(segmentId),
 			toggle: () => this.toggleThinking(segmentId),
 		};
 		return block;
 	}
 
-	private thinkingStatus(group: AggregateGroup, parts: readonly AggregateThinkingPart[]): AggregateThinkingStatus {
-		if (this.activeThinkingTurn && group.agentTurnIds.includes(this.activeThinkingTurn)) return "active";
-		const last = parts.at(-1)!;
-		if (this.interruptedThinking.has(last.turnId)) return "interrupted";
-		const message = toRecord(last.source);
-		const content = messageContent(message);
-		const endsInThinking = toRecord(content.at(-1)).type === "thinking";
+	private thinkingPartStatus(part: AggregateThinkingPart): AggregateThinkingStatus {
+		if (this.activeThinkingTurn === part.turnId) return "active";
+		if (this.interruptedThinking.has(part.turnId)) return "interrupted";
+		const message = toRecord(part.source);
+		const endsInThinking = toRecord(messageContent(message).at(-1)).type === "thinking";
 		if (endsInThinking && message.stopReason === "aborted") return "interrupted";
 		if (endsInThinking && (message.stopReason === "error" || message.stopReason === "length")) return "failed";
 		return "done";
@@ -1498,7 +1504,7 @@ export class AggregateProjection {
 		const block = this.thinkingBlockFor(group);
 		const segmentId = this.segmentIdOf(group);
 		const signature = block
-			? `${block.parts.length}|${block.status}|${block.expanded ? block.parts.map((part) => thinkingSize(part.source)).join(",") : ""}`
+			? `${block.parts.length}|${block.status}|${block.expanded ? block.parts.map((part) => `${part.status}:${part.calls.length}:${part.expanded || block.parts.length === 1 ? thinkingSize(part.source) : ""}`).join(",") : ""}`
 			: "";
 		if (this.thinkingSignatures.get(segmentId) === signature) return;
 		this.thinkingSignatures.set(segmentId, signature);
@@ -1522,6 +1528,34 @@ export class AggregateProjection {
 	/** Independent of Ctrl+O and Run expansion. */
 	toggleThinking(segmentId: string): void {
 		if (!this.expandedThinking.delete(segmentId)) this.expandedThinking.add(segmentId);
+		this.thinkingSignatures.delete(segmentId);
+		this.invalidateThinkingKeys(this.thinkingHosts.get(segmentId));
+	}
+
+	private thinkingPartRun(turnId: string): AggregateViewportRun {
+		const cached = this.thinkingPartRuns.get(turnId);
+		if (cached) return cached;
+		const run: AggregateViewportRun = {
+			owner: this.thinkingViewportOwner, id: `thinking-part:${turnId}`,
+			isValid: () => this.thinkingPartRuns.get(turnId) === run && this.thinkingShown && this.thinkingByTurn.has(turnId),
+			isExpanded: () => this.expandedThinkingParts.has(turnId),
+			toggle: () => this.toggleThinkingPart(turnId),
+			label: () => {
+				const group = this.displayGroupForItem(turnId);
+				const index = group?.agentTurnIds.filter((id) => this.thinkingByTurn.has(id)).indexOf(turnId) ?? -1;
+				return index >= 0 ? `Thinking · Part ${index + 1}` : "Thinking";
+			},
+		};
+		this.thinkingPartRuns.set(turnId, run);
+		return run;
+	}
+
+	/** One part inside an open block; the block and its other parts keep their state. */
+	toggleThinkingPart(turnId: string): void {
+		if (!this.expandedThinkingParts.delete(turnId)) this.expandedThinkingParts.add(turnId);
+		const group = this.displayGroupForItem(turnId);
+		if (!group) return;
+		const segmentId = this.segmentIdOf(group);
 		this.thinkingSignatures.delete(segmentId);
 		this.invalidateThinkingKeys(this.thinkingHosts.get(segmentId));
 	}
@@ -2095,6 +2129,7 @@ export class AggregateProjection {
 			if (!expansionKeys.has(key)) this.expandedGroups.delete(key);
 		}
 		for (const id of this.expandedThinking) if (!this.segmentsById.has(id)) this.expandedThinking.delete(id);
+		for (const id of this.expandedThinkingParts) if (!this.thinkingByTurn.has(id)) this.expandedThinkingParts.delete(id);
 		this.rebuildContextGrowth(projectedEntries);
 		this.syncRunPulse();
 	}
@@ -2560,14 +2595,15 @@ export function attachRunThinking(
 	width: number,
 	regions: AggregateClickRegion[],
 	component: object,
-): { titleRow: number; viewport: { run: AggregateViewportRun; titleRow: number } } | undefined {
+): { titleRow: number; viewports: Array<{ run: AggregateViewportRun; titleRow: number; endRow: number }> } | undefined {
 	const block = projection.getRunThinkingBlock(itemId, expanded);
 	if (!block) return undefined;
 	const rendered = renderAggregateThinkingBlock(block, width, projection.getRenderTheme());
-	if (!rendered.length) return undefined;
-	const titleRow = appendThinkingBlock(lines, rendered);
-	regions.push({ startRow: titleRow, endRow: titleRow + 1, onClick: () => toggleAggregateViewportRun(component, block.run) });
-	return { titleRow, viewport: { run: block.run, titleRow } };
+	if (!rendered.lines.length) return undefined;
+	const titleRow = appendThinkingBlock(lines, rendered.lines);
+	const targets = thinkingTargets(block, rendered, titleRow, component);
+	regions.push(...targets.regions);
+	return { titleRow, viewports: targets.viewports };
 }
 
 export function attachExpandedAggregateSummary(
@@ -2843,7 +2879,7 @@ export function patchAggregateToolExecutions(projection: AggregateProjection): v
 			}) });
 			const runRegion = run ? { run, ...(offset > 0 ? { titleRow: 1 } : {}) } : undefined;
 			const thinking = attachRunThinking(activeProjection, toolCallId, true, lines, width, regions, this);
-			const viewports = [...(runRegion ? [{ ...runRegion, ...(thinking ? { endRow: thinking.titleRow } : {}) }] : []), ...(thinking ? [thinking.viewport] : [])];
+			const viewports = [...(runRegion ? [{ ...runRegion, ...(thinking ? { endRow: thinking.titleRow } : {}) }] : []), ...(thinking?.viewports ?? [])];
 			recordAggregateClickRegions(this, width, lines.length, regions, viewports.length ? viewports : undefined);
 			return lines;
 		}
@@ -2852,7 +2888,7 @@ export function patchAggregateToolExecutions(projection: AggregateProjection): v
 		regions.push({ startRow: 1, endRow: lines.length - 1, onClick: toggle });
 		const thinking = attachRunThinking(activeProjection, toolCallId, false, lines, width, regions, this);
 		if (thinking) regions[0]!.endRow = thinking.titleRow;
-		const viewports = [...(run ? [{ run, titleRow: 1, ...(thinking ? { endRow: thinking.titleRow } : {}) }] : []), ...(thinking ? [thinking.viewport] : [])];
+		const viewports = [...(run ? [{ run, titleRow: 1, ...(thinking ? { endRow: thinking.titleRow } : {}) }] : []), ...(thinking?.viewports ?? [])];
 		recordAggregateClickRegions(this, width, lines.length, regions, viewports.length ? viewports : undefined);
 		return lines;
 	};

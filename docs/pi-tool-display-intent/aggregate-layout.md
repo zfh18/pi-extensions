@@ -217,15 +217,17 @@ Pi 0.85 的工具鼠标区域属于原生子组件布局，不能直接复用在
 
 ### Thinking 块
 
-布局固定为 `[Run] → Thinking → 回答`。思考按 Run 展示段收集，而不是按承载组件：只有 thinking 与工具调用、没有旁白的消息本身零高度，思考只能由投影层从 `ingestAssistantMessage` 读到。每段一个块，steer 切段时随 Run 一起切开；块内按 agent turn 时间顺序排列，各段末尾附它引出的调用，弥补块位于工具之后造成的时间顺序偏离。
+布局固定为 `[Run] → Thinking → 回答`。思考按 Run 展示段收集，而不是按承载组件：只有 thinking 与工具调用、没有旁白的消息本身零高度，思考只能由投影层从 `ingestAssistantMessage` 读到。每段一个块，steer 切段时随 Run 一起切开；块内按 agent turn 时间顺序排列，各段标题附它引出的调用，弥补块位于工具之后造成的时间顺序偏离。
 
 承载者每段唯一：段内有 Run 时为 Run 的末行宿主（收起时是摘要所在工具组件，展开时是 Run 最后一项），块追加在其下方；收起摘要与展开 Run 都结束在同一位置，Ctrl+O 时块不跳动。整段只有直接显示的工具或没有 Run 时，退回到该段最新的 assistant 消息，放在其正文上方。所有 assistant 正文剥离 thinking，避免第二处显示；没有投影时保持 Pi 原生行为。
 
 块独立开合，Ctrl+O 不影响；局部开合以段身份记录，并复用账本视口锚定保持标题行位置——同一组件可同时登记 Run 与 Thinking 两个锚点，Run 的几何范围在块标题处截止。Pi 的 `hideThinkingBlock`（设置或 Ctrl+T）为 true 时不显示块，不把隐藏改写成收起。
 
+两级收起：块内有多段时，展开块只列出每段一行收起的标题（`● Part N · → 调用 ▸`），各段以 turn 身份独立开合并各自登记视口锚点，嵌套段的几何范围在下一段标题处截止。段标题空间不足时先截断调用列表，保留折叠标记。段状态点按该 turn 单独判定，块状态点取段内最差状态：有段仍在思考为黄色，否则跟随最后一段。收起块不会丢弃段的开合选择，再次展开时恢复。只有一段时不嵌套，展开块直接显示正文和调用行。
+
 状态点为静态颜色，不用定时器：存在仍在接收 `thinking_start/thinking_delta` 而未收到对应 `thinking_end` 的 turn 时黄色；全部结束为绿色；`agent_settled` 时仍未结束、或历史中 `stopReason` 为 aborted 的为中断，error 为失败。绿色以段内各 thinking 内容块的 `thinking_end` 为准，不等 message 或 Run 结束。
 
-性能约束：收起时只画一行标题，不拼接或排版思考正文；展开正文按 turn 与宽度缓存，以思考字符数判断失效。流式 delta 只在块已展开或状态颜色变化时请求宿主重绘；不调用 `setHiddenThinkingLabel()`，不让整份 transcript 失效。
+性能约束：收起时只画一行标题，不拼接或排版思考正文；展开块中收起的段同样只画标题；展开正文按 turn 与宽度缓存，以思考字符数判断失效。流式 delta 只在所在段已展开或状态颜色变化时请求宿主重绘；不调用 `setHiddenThinkingLabel()`，不让整份 transcript 失效。
 
 ## 上下文增长的口径
 
@@ -335,5 +337,5 @@ ctx.sessionManager.buildContextEntries()
 10. 非 leader 成员真实零高度，无 Spacer、空 Box 或背景行。
 11. reload/resume/tree/compaction 后 counts、leader、failed 正确，瞬态 done 不恢复。
 12. 聚合不改写 Session call/result，不向模型上下文注入 Run 数据。
-13. Pi 显示 thinking 时，每个 Run 段一个默认收起的静态 Thinking 块，位于 Run 下方、回答上方；无 Run 时在回答上方。块独立于 Ctrl+O，展开 Run 不含思考；`hideThinkingBlock` 时不显示。thinking 不当旁白，不进展开边框；最终结论、错误保留在块外。
+13. Pi 显示 thinking 时，每个 Run 段一个默认收起的静态 Thinking 块，位于 Run 下方、回答上方；无 Run 时在回答上方。块独立于 Ctrl+O，展开 Run 不含思考；多段时块内各段再独立收起；`hideThinkingBlock` 时不显示。thinking 不当旁白，不进展开边框；最终结论、错误保留在块外。
 14. HTML export 与 individual 历史 renderer 保持可用。

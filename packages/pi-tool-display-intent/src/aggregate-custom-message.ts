@@ -192,7 +192,7 @@ export function patchAggregateCustomMessages(): void {
 			const collapsedRegions: AggregateClickRegion[] = [{ startRow: 1, endRow: lines.length - 1, onClick: toggle }];
 			const thinking = attachRunThinking(projection, id, false, lines, width, collapsedRegions, this);
 			if (thinking) collapsedRegions[0]!.endRow = thinking.titleRow;
-			const viewports = [...(run ? [{ run, titleRow: 1, ...(thinking ? { endRow: thinking.titleRow } : {}) }] : []), ...(thinking ? [thinking.viewport] : [])];
+			const viewports = [...(run ? [{ run, titleRow: 1, ...(thinking ? { endRow: thinking.titleRow } : {}) }] : []), ...(thinking?.viewports ?? [])];
 			recordAggregateClickRegions(this, width, lines.length, collapsedRegions, viewports.length ? viewports : undefined);
 			return lines;
 		}
@@ -211,7 +211,7 @@ export function patchAggregateCustomMessages(): void {
 		const bodyHeight = lines.length;
 		const thinking = attachRunThinking(projection, id, true, lines, width, regions, this);
 		const runRegion = run ? { run, ...(top > 0 ? { titleRow: 1 } : {}), ...(thinking ? { endRow: thinking.titleRow } : {}) } : undefined;
-		const viewports = [...(runRegion ? [runRegion] : []), ...(thinking ? [thinking.viewport] : [])];
+		const viewports = [...(runRegion ? [runRegion] : []), ...(thinking?.viewports ?? [])];
 		recordAggregateNativeRegion(this, width, lines.length,
 			{ left: 4, top, width: innerWidth, height: Math.min(body.length, bodyHeight - top) }, regions,
 			viewports.length ? viewports : undefined);

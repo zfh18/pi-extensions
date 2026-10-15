@@ -102,21 +102,66 @@ for (const live of [true, false]) test(`${live ? "live" : "history"}: one segmen
 		assert.doesNotMatch(expandedRun, /plan|conclude/, "an expanded Run never contains thinking");
 		p.noteTimelineExpansion(false);
 
-		// The block opens independently, in time order, annotated with the calls each part led to.
+		// The block opens independently into a list of folded parts, each titled with the calls it led to.
 		const segment = p.getRunThinkingBlock("b", false)!;
 		segment.toggle();
 		const open = clean(root.render(100));
-		order(open, "Run (2 calls", "Thinking · 3 parts ▾", "plan A", "→ Read(a.ts)", "plan B", "→ Read(b.ts)", "conclude", "└", "done");
-		assert.match(open, /Run \(2 calls[^\n]*/);
-		assert.doesNotMatch(open, /\*\*A\*\*/, "thinking renders as Markdown");
+		order(open, "Run (2 calls", "Thinking · 3 parts ▾", "●<success> Part 1 · → Read(a.ts) ▸", "Part 2 · → Read(b.ts) ▸", "Part 3 ▸", "└", "done");
+		assert.doesNotMatch(open, /plan|conclude/, "folded parts never paint their text");
+
+		// Parts fold on their own; opening one leaves the others folded.
+		p.getRunThinkingBlock("b", false)!.parts[0]!.run.toggle();
+		const part = clean(root.render(100));
+		order(part, "Thinking · 3 parts ▾", "Part 1 · → Read(a.ts) ▾", "plan A", "Part 2 · → Read(b.ts) ▸", "Part 3 ▸", "done");
+		assert.doesNotMatch(part, /plan B|conclude/);
+		assert.doesNotMatch(part, /\*\*A\*\*/, "thinking renders as Markdown");
 
 		p.noteTimelineExpansion(true);
 		const both = clean(root.render(100));
-		order(both, "Read(a.ts)", "Read(b.ts)", "Thinking · 3 parts ▾", "plan A", "conclude", "done");
+		order(both, "Read(a.ts)", "Read(b.ts)", "Thinking · 3 parts ▾", "plan A", "Part 3 ▸", "done");
 		const runEnd = both.indexOf("└ ●<success> Read(b.ts)");
 		assert.ok(runEnd >= 0 && both.indexOf("plan A") > runEnd, "thinking is not interleaved with Run rows");
 		p.noteTimelineExpansion(false);
-		assert.match(clean(root.render(100)), /Thinking · 3 parts ▾/, "Ctrl+O does not fold Thinking");
+		assert.match(clean(root.render(100)), /Thinking · 3 parts ▾[\s\S]*Part 1 · → Read\(a\.ts\) ▾/, "Ctrl+O folds neither the block nor its parts");
+
+		// Folding the block keeps part choices for the next time it opens.
+		segment.toggle();
+		assert.doesNotMatch(clean(root.render(100)), /Part 1|plan A/);
+		segment.toggle();
+		assert.match(clean(root.render(100)), /Part 1 · → Read\(a\.ts\) ▾/);
+	} finally { teardown(); }
+});
+
+test("a single-part block opens straight to its body with the calls line", () => {
+	const p = setup();
+	try {
+		const messages = [user("request", 100), call("a", "turn-a", 110, "only plan"), result("a", 120), answer("final", 130, "done")];
+		const { root } = transcript(p, messages);
+		root.render(100);
+		p.getRunThinkingBlock("a", false)!.toggle();
+		const open = clean(root.render(100));
+		order(open, "Thinking ▾", "only plan", "→ Read(a.ts)", "└", "done");
+		assert.doesNotMatch(open, /Part 1/, "no nested fold for one part");
+	} finally { teardown(); }
+});
+
+test("part titles keep their fold marker when calls overflow a narrow width", () => {
+	const p = setup();
+	try {
+		const long = (id: string) => ({ ...call(id, `turn-${id}`, 110, `plan ${id}`), content: [
+			{ type: "thinking", thinking: `plan ${id}` },
+			...[1, 2, 3, 4].map((n) => ({ type: "toolCall", id: `${id}${n}`, name: "read", arguments: { path: `some/very/long/directory/file-${n}.ts` } })),
+		] });
+		const messages = [user("request", 100), long("x"), long("y"), answer("final", 130, "done")];
+		const { root } = transcript(p, messages);
+		root.render(100);
+		p.getRunThinkingBlock("y4", false)!.toggle();
+		for (const width of [36, 60, 120]) {
+			const rows = clean(root.render(width)).split("\n").filter((line) => /Part \d/.test(line));
+			assert.equal(rows.length, 2, `width ${width}`);
+			for (const row of rows) assert.match(row, /▸\s*$/, `width ${width}: ${row}`);
+		}
+		assert.match(clean(root.render(160)), /Part 1 · → Read\(x1\.ts\) · Read\(x2\.ts\) · Read\(x3\.ts\) · \+1 ▸/);
 	} finally { teardown(); }
 });
 
@@ -191,10 +236,16 @@ test("static status: yellow while thinking, green at thinking_end, never green w
 		const next = new AssistantMessageComponent(second as never, false);
 		root.addChild(next);
 		assert.match(clean(root.render(80)), /●<warning> Thinking · 2 parts/);
+		p.getTurnThinkingBlock(second)!.toggle();
+		const open = clean(root.render(80));
+		order(open, "●<warning> Thinking · 2 parts ▾", "●<success> Part 1 ▸", "●<warning> Part 2 ▸");
+		p.getTurnThinkingBlock(second)!.toggle();
 		await handlers.get("agent_settled")!({});
 		const settled = clean(root.render(80));
 		assert.doesNotMatch(settled, /●<success>|●<warning>/);
 		assert.match(settled, /Thinking · 2 parts · interrupted/);
+		p.getTurnThinkingBlock(second)!.toggle();
+		order(clean(root.render(80)), "●<success> Part 1 ▸", "●<muted> Part 2 · interrupted ▸");
 	} finally { teardown(); }
 });
 
@@ -235,7 +286,12 @@ test("folded blocks never lay out thinking; streaming deltas do not repaint a fo
 		assert.equal(pass(true), steady, "folded thinking growth adds no repaint over ordinary streaming");
 		block.toggle();
 		root.render(100);
+		assert.ok(p.getRunThinkingBlock("b", false)!.parts.every((part) => part.cache === undefined), "an open block with folded parts lays out no body");
+		assert.equal(pass(true), pass(false), "growth inside a folded part adds no repaint");
+		for (const part of p.getRunThinkingBlock("b", false)!.parts) part.run.toggle();
+		root.render(100);
 		const caches = p.getRunThinkingBlock("b", false)!.parts.map((part) => part.cache);
+		assert.ok(caches.every(Boolean), "open parts lay out their bodies");
 		root.render(100);
 		assert.deepEqual(p.getRunThinkingBlock("b", false)!.parts.map((part) => part.cache), caches, "expanded bodies are cached");
 	} finally { teardown(); }
@@ -256,14 +312,27 @@ test("fullscreen click toggles only Thinking and keeps its title row in place", 
 		assert.ok(row > 0);
 		screen.terminal.click(4, row);
 		screen.paint();
-		const lines = screen.lines();
+		let lines = screen.lines();
 		assert.equal(lines.findIndex((line) => line.includes("Thinking · 3 parts ▾")), row, "title stays anchored");
-		assert.ok(lines.some((line) => line.includes("plan A")));
 		assert.ok(lines.some((line) => line.includes("Run (2 calls")), "Run stays collapsed");
 		assert.equal(p.isItemExpanded("b"), false, "Run stays collapsed");
+		assert.ok(!lines.some((line) => line.includes("plan A")), "parts open folded");
+
+		// Clicking a part title opens only that part, keeping its title in place.
+		const partRow = lines.findIndex((line) => line.includes("Part 2"));
+		assert.ok(partRow > row);
 		now += 1000; // A deliberate second click, not native double-click selection.
+		screen.terminal.click(6, partRow);
+		screen.paint();
+		lines = screen.lines();
+		assert.equal(lines.findIndex((line) => line.includes("Part 2 · → Read(b.ts) ▾")), partRow, "part title stays anchored");
+		assert.ok(lines.some((line) => line.includes("plan B")));
+		assert.ok(!lines.some((line) => line.includes("plan A") || line.includes("conclude")), "other parts stay folded");
+		assert.equal(lines.findIndex((line) => line.includes("Thinking · 3 parts ▾")), row, "block stays open");
+
+		now += 1000;
 		screen.terminal.click(4, row);
 		screen.paint();
-		assert.ok(!screen.lines().some((line) => line.includes("plan A")));
+		assert.ok(!screen.lines().some((line) => line.includes("plan B") || line.includes("Part 2")));
 	} finally { screen.stop(); teardown(); }
 });

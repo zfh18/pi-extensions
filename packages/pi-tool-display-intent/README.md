@@ -106,7 +106,7 @@ In the ledger, `Bash(command)` is shown only when the complete target fits one d
 
 Steer messages wrap at the terminal width. Up to eight content rows stay visible; longer messages keep the first three and last two rows around `… N lines hidden · click to view`. Click that omission row to inspect the original message. Run folding and `Ctrl+O` do not change this preview; Pi's previous/next-message shortcuts can still reach each steer.
 
-When Pi shows thinking, each Run segment collects its thinking into one folded `● Thinking` block placed below the Run and above the answer; without a Run it sits directly above the answer. The dot is static: yellow while thinking, green when done, muted when interrupted. Click the title to open only that block: parts appear in time order, each followed by the calls it led to. `Ctrl+O` never folds or opens Thinking, and an expanded Run contains no thinking. Steers split Thinking like Runs. If you hide thinking in Pi, no block is shown.
+When Pi shows thinking, each Run segment collects its thinking into one folded `● Thinking` block placed below the Run and above the answer; without a Run it sits directly above the answer. The dot is static: yellow while thinking, green when done, muted when interrupted. Click the title to open only that block. With several parts it lists one folded title per part, in time order, showing the calls that part led to; click a part title to read just that part. A single part opens straight to its text. `Ctrl+O` never folds or opens Thinking, and an expanded Run contains no thinking. Steers split Thinking like Runs. If you hide thinking in Pi, no block is shown.
 
 ### Context growth
 

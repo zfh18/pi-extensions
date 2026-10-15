@@ -17,8 +17,7 @@ import {
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { patchAggregateMouseHandling, recordAggregateClickRegions, recordAggregateNativeRegion, releaseAggregateClickRegions, restoreAggregateMouseHandling, type AggregateClickRegion } from "./aggregate-interaction.js";
 import { hasPromptZoneStart, markPromptZone, stripPromptZone } from "./prompt-zone-markers.js";
-import { renderAggregateThinkingBlock, type AggregateThinkingBlock } from "./aggregate-thinking-block.js";
-import { toggleAggregateViewportRun } from "./aggregate-viewport.js";
+import { renderAggregateThinkingBlock, thinkingTargets, type ThinkingTargets } from "./aggregate-thinking-block.js";
 
 interface PatchableAssistantMessage {
 	render(width: number): string[];
@@ -259,13 +258,13 @@ function turnThinking(
 	component: PatchableAssistantMessage,
 	projection: AggregateProjection | undefined,
 	width: number,
-): { block: AggregateThinkingBlock; lines: string[]; region: AggregateClickRegion } | undefined {
+): ({ lines: string[] } & ThinkingTargets) | undefined {
 	const block = projection?.getTurnThinkingBlock(component.lastMessage);
 	if (!block) return undefined;
-	const lines = renderAggregateThinkingBlock(block, width, resolveAggregateRenderTheme(projection));
-	if (!lines.length) return undefined;
+	const rendered = renderAggregateThinkingBlock(block, width, resolveAggregateRenderTheme(projection));
+	if (!rendered.lines.length) return undefined;
 	// Row 1: callers put the block below the native leading blank.
-	return { block, lines, region: { startRow: 1, endRow: 2, onClick: () => toggleAggregateViewportRun(component, block.run) } };
+	return { lines: rendered.lines, ...thinkingTargets(block, rendered, 1, component) };
 }
 
 export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boolean): void {
@@ -362,7 +361,7 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 				const fallback = turnThinking(this, projection, width);
 				if (!fallback) return [];
 				const lines = ["", ...fallback.lines, ""];
-				recordAggregateClickRegions(this, width, lines.length, [fallback.region], { run: fallback.block.run, titleRow: 1 });
+				recordAggregateClickRegions(this, width, lines.length, fallback.regions, fallback.viewports);
 				return lines;
 			}
 			projection?.trackFramedItem(frameId, undefined, toolCallId);
@@ -378,10 +377,9 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 			const bodyTop = lines.length;
 			if (trimmed.length) lines.push("", ...trimmed);
 			lines.push(...contextLines);
-			const viewport = { run: ownThinking.block.run, titleRow: 1 };
 			// The separator row stands in for the native leading Spacer of the stripped body.
-			if (trimmed.length) recordAggregateNativeRegion(this, width, lines.length, { left: 0, top: bodyTop, width, height: trimmed.length + 1 }, [ownThinking.region], viewport);
-			else recordAggregateClickRegions(this, width, lines.length, [ownThinking.region], viewport);
+			if (trimmed.length) recordAggregateNativeRegion(this, width, lines.length, { left: 0, top: bodyTop, width, height: trimmed.length + 1 }, ownThinking.regions, ownThinking.viewports);
+			else recordAggregateClickRegions(this, width, lines.length, ownThinking.regions, ownThinking.viewports);
 			return toolCallId ? lines : markPromptZone(lines);
 		}
 		if (trimmed.length === 0) return markHostPromptZone(contextLines.length > 0 ? ["", ...contextLines] : []);
@@ -414,7 +412,7 @@ export function patchAggregateThinkingPlaceholders(isAggregateEnabled: () => boo
 		}
 		const thinking = projection ? attachRunThinking(projection, frameId, true, lines, width, regions, this) : undefined;
 		const runRegion = run ? { run, ...(titleRow !== undefined ? { titleRow } : {}), ...(thinking ? { endRow: thinking.titleRow } : {}) } : undefined;
-		const viewports = [...(runRegion ? [runRegion] : []), ...(thinking ? [thinking.viewport] : [])];
+		const viewports = [...(runRegion ? [runRegion] : []), ...(thinking?.viewports ?? [])];
 		recordAggregateClickRegions(this, width, lines.length, regions, viewports.length ? viewports : undefined);
 		return markHostPromptZone(lines);
 	};
