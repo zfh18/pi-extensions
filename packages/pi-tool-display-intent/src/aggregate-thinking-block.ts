@@ -127,22 +127,25 @@ export function renderAggregateThinkingBlock(block: AggregateThinkingBlock, widt
 	const parts: RenderedThinkingBlock["parts"] = [];
 	if (!block.expanded) return { lines, parts };
 	const rail = paint(theme, "muted", "│");
-	const row = (text: string) => lines.push(truncateToWidth(`${rail} ${text}`, safeWidth, "…"));
+	// Like the Run frame, the last body row carries the close instead of a bare `└` row.
+	const body: string[] = [];
 	const single = block.parts.length === 1 ? block.parts[0] : undefined;
 	if (single) {
-		for (const line of renderPartBody(single, Math.max(1, safeWidth - 2), theme)) row(line);
+		body.push(...renderPartBody(single, Math.max(1, safeWidth - 2), theme));
 		const calls = callsText(single);
-		if (calls) row(paint(theme, "muted", calls));
+		if (calls) body.push(paint(theme, "muted", calls));
 	} else {
 		const innerWidth = Math.max(1, safeWidth - 2);
 		block.parts.forEach((part, index) => {
-			const start = lines.length;
-			row(partTitle(part, index, innerWidth, theme));
-			if (part.expanded) for (const line of renderPartBody(part, Math.max(1, safeWidth - 4), theme)) row(`${rail} ${line}`);
-			parts.push({ part, row: start, end: lines.length });
+			const start = lines.length + body.length;
+			body.push(partTitle(part, index, innerWidth, theme));
+			if (part.expanded) for (const line of renderPartBody(part, Math.max(1, safeWidth - 4), theme)) body.push(`${rail} ${line}`);
+			parts.push({ part, row: start, end: lines.length + body.length });
 		});
 	}
-	lines.push(truncateToWidth(paint(theme, "muted", "└"), safeWidth, "…"));
+	const close = paint(theme, "muted", "└");
+	if (!body.length) lines.push(truncateToWidth(close, safeWidth, "…"));
+	body.forEach((text, index) => lines.push(truncateToWidth(`${index === body.length - 1 ? close : rail} ${text}`, safeWidth, "…")));
 	return { lines, parts };
 }
 

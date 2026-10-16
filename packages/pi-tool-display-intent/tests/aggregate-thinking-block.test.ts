@@ -106,7 +106,8 @@ for (const live of [true, false]) test(`${live ? "live" : "history"}: one segmen
 		const segment = p.getRunThinkingBlock("b", false)!;
 		segment.toggle();
 		const open = clean(root.render(100));
-		order(open, "Run (2 calls", "Thinking · 3 parts ▾", "●<success> Part 1 · → Read(a.ts) ▸", "Part 2 · → Read(b.ts) ▸", "Part 3 ▸", "└", "done");
+		order(open, "Run (2 calls", "Thinking · 3 parts ▾", "│ ●<success> Part 1 · → Read(a.ts) ▸", "│ ●<success> Part 2 · → Read(b.ts) ▸", "└ ●<success> Part 3 ▸", "done");
+		assert.doesNotMatch(open, /^└\s*$/m, "like the Run, the last row carries the close; no bare closing row");
 		assert.doesNotMatch(open, /plan|conclude/, "folded parts never paint their text");
 
 		// Parts fold on their own; opening one leaves the others folded.
@@ -140,7 +141,8 @@ test("a single-part block opens straight to its body with the calls line", () =>
 		root.render(100);
 		p.getRunThinkingBlock("a", false)!.toggle();
 		const open = clean(root.render(100));
-		order(open, "Thinking ▾", "only plan", "→ Read(a.ts)", "└", "done");
+		order(open, "Thinking ▾", "│ only plan", "└ → Read(a.ts)", "done");
+		assert.doesNotMatch(open, /^└\s*$/m, "no bare closing row");
 		assert.doesNotMatch(open, /Part 1/, "no nested fold for one part");
 	} finally { teardown(); }
 });
